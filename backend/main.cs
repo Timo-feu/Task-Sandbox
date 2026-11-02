@@ -10,6 +10,15 @@ namespace TaskSandbox
         public int ID {get; set;}
         public string Payload {get; set;} = string.Empty;
         public string WorkDir {get; set;} = string.Empty;
+        public StatusT Status {get; set;} = StatusT.Proceed;
+
+
+        public enum StatusT : byte
+        {
+            Proceed,
+            Ready,
+            InProgress,
+        }
 
         public enum TaskValidationResult : byte
         {
@@ -36,7 +45,16 @@ namespace TaskSandbox
             return TaskValidationResult.Success;
         }
 
-        public async void RunAsync()
+        public async Task RunAsync()
+        {
+            if (File.Exists(Path.Combine(this.WorkDir, $"task_{this.ID}.txt"))) await this.WriteAsyncFile();
+            this.Status = StatusT.InProgress;
+            await this.RunPromtLLM();
+            this.Status = StatusT.Ready;
+            Console.WriteLine($"[Consumer] Задача {this.ID} завершена.");
+        }
+
+        public async Task WriteAsyncFile()
         {
             TaskValidationResult status = this.IsValidDirectory();
             
@@ -58,26 +76,16 @@ namespace TaskSandbox
             await File.WriteAllTextAsync(Path.Combine(this.WorkDir, $"task_{this.ID}.txt"), this.Payload);
         }
 
-        public async void WriteAsyncFile()
+        public async Task RunPromtLLM()
         {
-            TaskValidationResult status = this.IsValidDirectory();
-            
-            int idx = (int)status;
-            Console.WriteLine($"[Consumer] Task {this.ID}: {statusMessages[idx]}");
+            // передача промта локалке
+            var answer = ""; 
+            await this.WriteAyncForFile(answer);
+        }
 
-            if (status == TaskValidationResult.EmptyPath || status == TaskValidationResult.InvalidCharacters)
-            {
-                Console.WriteLine($"[Consumer] Задача {this.ID} отклонена.");
-                return; 
-            }
-
-            if (status == TaskValidationResult.DirectoryNotFound)
-            {
-                Directory.CreateDirectory(this.WorkDir);
-                Console.WriteLine($"[Consumer] Задача {this.ID}: Директория '{this.WorkDir}' успешно создана. Задача принята в разработку.");
-            }
-
-            await File.WriteAllTextAsync(Path.Combine(this.WorkDir, $"task_{this.ID}.txt"), this.Payload);
+        public async Task WriteAyncForFile(string answer)
+        {
+            await File.WriteAllTextAsync(Path.Combine(this.WorkDir, $"task_{this.ID}.txt"), answer);
         }
     }
 
