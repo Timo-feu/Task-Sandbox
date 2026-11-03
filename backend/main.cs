@@ -78,7 +78,6 @@ namespace TaskSandbox
 
         public async Task RunPromtLLM()
         {
-            // передача промта локалке
             var answer = ""; 
             await this.WriteAyncForFile(answer);
         }
