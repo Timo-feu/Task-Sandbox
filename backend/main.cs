@@ -78,6 +78,7 @@ namespace TaskSandbox
 
         public async Task RunPromtLLM()
         {
+            
             var answer = ""; 
             await this.WriteAyncForFile(answer);
         }
