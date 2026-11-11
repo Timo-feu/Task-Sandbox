@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using TaskSandbox.Prompting;
 
 namespace TaskSandbox;
 
@@ -22,12 +23,15 @@ public enum TaskValidationResult : byte
 
 public sealed class UserTask
 {
-    private const string SystemPrompt =
-        "Ты полезный ИИ-ассистент. Отвечай четко, кратко и на русском языке.";
-
     public int Id { get; init; }
     public string Payload { get; init; } = string.Empty;
     public string WorkDir { get; init; } = string.Empty;
+    public required PromptSet Prompts { get; init; }
+    public string ProjectMemoryMarkdown { get; init; } = string.Empty;
+    public string TargetFiles { get; init; } = "Не заданы; подходящие файлы необходимо определить после анализа.";
+    public string Requirements { get; init; } = "Дополнительные требования не заданы.";
+    public string CurrentProgress { get; init; } = "Задача ещё не начата.";
+    public string CompletedWork { get; init; } = "В рамках текущей задачи пока ничего не выполнено.";
     public TaskStatus Status { get; private set; } = TaskStatus.Proceed;
 
     public async Task RunAsync(
@@ -35,6 +39,7 @@ public sealed class UserTask
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(modelProvider);
+        ArgumentNullException.ThrowIfNull(Prompts);
 
         TaskValidationResult validation = ValidateWorkDirectory(WorkDir);
         if (validation != TaskValidationResult.Success)
@@ -57,12 +62,21 @@ public sealed class UserTask
 
             Console.WriteLine($"[Task {Id}] Потоковый запрос к AI Backend:");
 
-            var request = new ModelRequest(
-                [
-                    new ModelMessage("system", SystemPrompt),
-                    new ModelMessage("user", Payload)
-                ],
-                Temperature: 0.7f);
+            TaskPromptContext taskContext = new(
+                TaskId: Id,
+                WorkspacePath: WorkDir,
+                Description: Payload,
+                TargetFiles: TargetFiles,
+                Requirements: Requirements,
+                CurrentProgress: CurrentProgress,
+                CompletedWork: CompletedWork);
+
+            ModelMessage[] messages = AgentPromptBuilder.BuildTaskMessages(
+                Prompts,
+                ProjectMemoryMarkdown,
+                taskContext);
+
+            var request = new ModelRequest(messages, Temperature: 0.7f);
 
             var answer = new StringBuilder(1024);
 

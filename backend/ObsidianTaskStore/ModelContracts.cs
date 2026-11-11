@@ -87,7 +87,6 @@ public interface IModelProvider
     }
 }
 
-
 /// <summary>Optional model discovery supported by providers that expose a model-list endpoint.</summary>
 public interface IModelDiscovery
 {

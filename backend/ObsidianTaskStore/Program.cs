@@ -1,4 +1,6 @@
 using System.Threading.Channels;
+using TaskSandbox.Memory;
+using TaskSandbox.Prompting;
 
 namespace TaskSandbox;
 
@@ -41,6 +43,12 @@ public static class Program
 
         try
         {
+            PromptSet prompts = await PromptLoader.LoadAsync(
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"[Prompts] Загружены Markdown-промпты: {prompts.DirectoryPath}");
+            Console.WriteLine($"[Prompts] Memory={((prompts.Features & PromptFeatures.Memory) != 0)}, " +
+                              $"UserExplanation={((prompts.Features & PromptFeatures.UserExplanation) != 0)}");
+
             IModelProvider modelProvider = await CreateModelProviderAsync(
                 httpClient,
                 cancellationToken).ConfigureAwait(false);
@@ -48,12 +56,23 @@ public static class Program
             string inputFilePath = Path.Combine(Environment.CurrentDirectory, "prompts.txt");
             string targetDirectory = Path.Combine(Environment.CurrentDirectory, "TasksDir");
 
+            var memoryStore = new ProjectMemoryStore();
+            string projectMemoryMarkdown = await memoryStore.LoadAsync(
+                targetDirectory,
+                cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"[Memory] Project memory: {memoryStore.GetMemoryPath(targetDirectory)}");
+
             Task consumerTask = ConsumeAsync(modelProvider, cancellationToken);
 
             try
             {
                 await EnsureTestFileExistsAsync(inputFilePath, cancellationToken).ConfigureAwait(false);
-                await ProduceAsync(inputFilePath, targetDirectory, cancellationToken).ConfigureAwait(false);
+                await ProduceAsync(
+                    inputFilePath,
+                    targetDirectory,
+                    prompts,
+                    projectMemoryMarkdown,
+                    cancellationToken).ConfigureAwait(false);
             }
             finally
             {
@@ -157,6 +176,8 @@ public static class Program
     private static async Task ProduceAsync(
         string inputFilePath,
         string targetDirectory,
+        PromptSet prompts,
+        string projectMemoryMarkdown,
         CancellationToken cancellationToken)
     {
         int taskId = 0;
@@ -170,7 +191,9 @@ public static class Program
             {
                 Id = taskId++,
                 Payload = line,
-                WorkDir = targetDirectory
+                WorkDir = targetDirectory,
+                Prompts = prompts,
+                ProjectMemoryMarkdown = projectMemoryMarkdown
             };
 
             await UserTaskChannel.Writer.WriteAsync(task, cancellationToken).ConfigureAwait(false);
