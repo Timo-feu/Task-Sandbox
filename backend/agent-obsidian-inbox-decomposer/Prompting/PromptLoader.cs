@@ -5,8 +5,6 @@ namespace TaskSandbox.Prompting;
 /// <summary>Loads editable Markdown prompt templates from a directory outside the workspace.</summary>
 public static class PromptLoader
 {
-    public const string PromptDirectoryEnvironmentVariable = "LOCAL_CODING_AGENT_PROMPTS";
-
     private const string FlagsStart = "[flags]";
     private const string FlagsEnd = "[/flags]";
     private const int MaxPromptCharacters = 256 * 1024;
@@ -14,7 +12,7 @@ public static class PromptLoader
     private static readonly string[] PromptFiles =
     [
         "SystemPrompt.md",
-        "ProjectScanPrompt.md",
+        "TaskPlanningPrompt.md",
         "TaskExecutionPrompt.md"
     ];
 
@@ -27,7 +25,7 @@ public static class PromptLoader
 
         string systemPromptWithFlags = await ReadPromptAsync(
             Path.Combine(resolvedDirectory, PromptFiles[0]), cancellationToken).ConfigureAwait(false);
-        string projectScanPrompt = await ReadPromptAsync(
+        string taskPlanningPrompt = await ReadPromptAsync(
             Path.Combine(resolvedDirectory, PromptFiles[1]), cancellationToken).ConfigureAwait(false);
         string taskExecutionPrompt = await ReadPromptAsync(
             Path.Combine(resolvedDirectory, PromptFiles[2]), cancellationToken).ConfigureAwait(false);
@@ -44,19 +42,15 @@ public static class PromptLoader
         return new PromptSet(
             resolvedDirectory,
             systemPrompt,
-            projectScanPrompt,
+            taskPlanningPrompt,
             taskExecutionPrompt,
             features);
     }
 
     private static string ResolvePromptDirectory(string? promptDirectory)
     {
-        string? configuredDirectory = promptDirectory;
-        if (string.IsNullOrWhiteSpace(configuredDirectory))
-            configuredDirectory = Environment.GetEnvironmentVariable(PromptDirectoryEnvironmentVariable);
-
-        if (!string.IsNullOrWhiteSpace(configuredDirectory))
-            return Path.GetFullPath(configuredDirectory);
+        if (!string.IsNullOrWhiteSpace(promptDirectory))
+            return Path.GetFullPath(promptDirectory);
 
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (string.IsNullOrWhiteSpace(localAppData))

@@ -8,6 +8,16 @@ public enum ObsidianTaskPriority : byte
     Critical
 }
 
+public enum DependencyPolicy : byte
+{
+    /// <summary>Use only dependencies already declared by the project.</summary>
+    ExistingOnly,
+    /// <summary>New dependencies may be added only when technically justified by the task.</summary>
+    AllowIfNecessary,
+    /// <summary>New dependencies may be added when they are the best technical choice.</summary>
+    Unrestricted
+}
+
 public enum ObsidianTaskState : byte
 {
     Inbox,
@@ -34,12 +44,14 @@ public sealed record ObsidianTaskDocument(
     string? WorkspaceId,
     string? ParentId,
     ObsidianTaskPriority Priority,
+    DependencyPolicy DependencyPolicy,
     IReadOnlyList<string> DependsOn,
     IReadOnlyList<string> TargetFiles,
     IReadOnlyList<string> Requirements,
     IReadOnlyList<string> AcceptanceCriteria,
     string Status,
-    string SourcePath);
+    string SourcePath,
+    string ContentHash);
 
 /// <summary>One small task produced by the Task Decomposer.</summary>
 public sealed record ObsidianSubtaskDefinition(
@@ -51,6 +63,7 @@ public sealed record ObsidianSubtaskDefinition(
     IReadOnlyList<string> TargetFiles,
     IReadOnlyList<string> Requirements,
     IReadOnlyList<string> AcceptanceCriteria,
+    DependencyPolicy DependencyPolicy = global::TaskSandbox.Obsidian.DependencyPolicy.ExistingOnly,
     ObsidianTaskPriority Priority = ObsidianTaskPriority.Normal);
 
 /// <summary>Validated plan and its generated subtasks.</summary>
@@ -58,4 +71,5 @@ public sealed record ObsidianTaskPlan(
     string ParentTaskId,
     string Title,
     string PlanMarkdown,
-    IReadOnlyList<ObsidianSubtaskDefinition> Subtasks);
+    IReadOnlyList<ObsidianSubtaskDefinition> Subtasks,
+    string OriginalContentHash);

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "obsidian": {
+    "vaultPath": "D:\\Obsidian\\MyVault"
+  },
+  "workspaces": {
+    "defaultId": "main",
+    "registered": [
+      {
+        "id": "main",
+        "path": "D:\\Projects\\MyProject"
+      }
+    ]
+  },
+  "model": {
+    "baseUrl": "http://localhost:1234/",
+    "modelId": "local-model",
+    "requestTimeoutSeconds": 300
+  },
+  "prompts": {
+    "directoryPath": ""
+  },
+  "runtime": {
+    "inboxPollIntervalSeconds": 5,
+    "maxConcurrentTasks": 1,
+    "maxCorrectionAttempts": 3,
+    "processTimeoutSeconds": 600,
+    "maxProcessOutputCharacters": 65536
+  }
+}

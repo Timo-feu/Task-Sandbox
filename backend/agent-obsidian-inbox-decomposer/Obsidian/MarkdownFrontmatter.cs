@@ -38,6 +38,12 @@ internal sealed class MarkdownFrontmatter
         Values.Remove(key);
     }
 
+    public void Remove(string key)
+    {
+        Values.Remove(key);
+        Lists.Remove(key);
+    }
+
     public static MarkdownFrontmatter Parse(string markdown)
     {
         ArgumentNullException.ThrowIfNull(markdown);

@@ -1,4 +1,5 @@
 using System.Text;
+using System.Security.Cryptography;
 
 namespace TaskSandbox.Obsidian;
 
@@ -84,6 +85,140 @@ public sealed class ObsidianTaskStore
         return result;
     }
 
+    /// <summary>Reads parent tasks that are still waiting for the Decomposer.</summary>
+    public async Task<IReadOnlyList<ObsidianTaskDocument>> ReadPlanningTasksAsync(
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        string planningRoot = GetManagedDirectory(PlanningFolder);
+        var result = new List<ObsidianTaskDocument>();
+
+        foreach (string directory in Directory.EnumerateDirectories(planningRoot, "*", SearchOption.TopDirectoryOnly)
+                     .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            EnsureNoReparsePoints(directory);
+            string originalPath = Path.Combine(directory, "Original.md");
+            if (!File.Exists(originalPath))
+                continue;
+
+            string markdown = await ReadMarkdownAsync(originalPath, cancellationToken).ConfigureAwait(false);
+            ObsidianTaskDocument task = ParseTask(markdown, originalPath, Path.GetFileName(directory));
+            if (string.Equals(task.Status, "pending", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(task.Status))
+            {
+                // Recover a crash after the Inbox file was moved into Planning but before
+                // its Frontmatter status was updated. Planning/<id>/ is itself the durable
+                // indication that this note has been accepted for decomposition.
+                MarkdownFrontmatter acceptedFrontmatter = MarkdownFrontmatter.Parse(markdown);
+                acceptedFrontmatter.SetValue("status", "planning");
+                await WriteMarkdownAtomicAsync(originalPath, acceptedFrontmatter.ToMarkdown(), cancellationToken)
+                    .ConfigureAwait(false);
+                markdown = await ReadMarkdownAsync(originalPath, cancellationToken).ConfigureAwait(false);
+                task = ParseTask(markdown, originalPath, Path.GetFileName(directory));
+            }
+
+            if (!string.Equals(task.Status, "planning", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Recover the rare crash window after Queue directory publication but before
+            // the parent note's status update. Directory.Move is the publication commit.
+            string publishedQueue = Path.Combine(GetManagedDirectory(QueueFolder), task.Id);
+            if (Directory.Exists(publishedQueue))
+            {
+                EnsureNoReparsePoints(publishedQueue);
+                int subtaskCount = Directory.EnumerateFiles(publishedQueue, "*.md", SearchOption.TopDirectoryOnly).Count();
+                if (subtaskCount == 0)
+                    throw new InvalidDataException($"Queue для '{task.Id}' существует, но не содержит файлов подзадач.");
+                MarkdownFrontmatter frontmatter = MarkdownFrontmatter.Parse(markdown);
+                frontmatter.SetValue("status", "queued");
+                frontmatter.SetValue("subtask_count", subtaskCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                frontmatter.Remove("planning_error");
+                frontmatter.Remove("planning_error_utc");
+                frontmatter.Remove("planning_attempt");
+                frontmatter.Remove("planning_retry_after_utc");
+                await WriteMarkdownAtomicAsync(originalPath, frontmatter.ToMarkdown(), cancellationToken)
+                    .ConfigureAwait(false);
+                continue;
+            }
+
+            MarkdownFrontmatter taskFrontmatter = MarkdownFrontmatter.Parse(markdown);
+            string retryAfterValue = taskFrontmatter.GetValue("planning_retry_after_utc");
+            if (DateTimeOffset.TryParse(
+                    retryAfterValue,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal,
+                    out DateTimeOffset retryAfter) &&
+                retryAfter > DateTimeOffset.UtcNow)
+            {
+                continue;
+            }
+
+            result.Add(task);
+        }
+
+        return result;
+    }
+
+    /// <summary>Assigns the configured workspace ID when the Inbox note did not specify one.</summary>
+    public async Task<ObsidianTaskDocument> SetPlanningWorkspaceAsync(
+        string parentTaskId,
+        string workspaceId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        ValidateId(parentTaskId, nameof(parentTaskId));
+        ValidateId(workspaceId, nameof(workspaceId));
+
+        string path = Path.Combine(GetManagedDirectory(PlanningFolder), parentTaskId, "Original.md");
+        EnsureExistingManagedDirectory(Path.GetDirectoryName(path)!, PlanningFolder, parentTaskId);
+        string markdown = await ReadMarkdownAsync(path, cancellationToken).ConfigureAwait(false);
+        MarkdownFrontmatter frontmatter = MarkdownFrontmatter.Parse(markdown);
+        string existingWorkspace = frontmatter.GetValue("workspace");
+        if (!string.IsNullOrWhiteSpace(existingWorkspace) &&
+            !string.Equals(existingWorkspace, workspaceId, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                $"Задача '{parentTaskId}' назначена Workspace '{existingWorkspace}', а приложение настроено на '{workspaceId}'.");
+        }
+
+        frontmatter.SetValue("workspace", workspaceId);
+        await WriteMarkdownAtomicAsync(path, frontmatter.ToMarkdown(), cancellationToken).ConfigureAwait(false);
+        string updatedMarkdown = await ReadMarkdownAsync(path, cancellationToken).ConfigureAwait(false);
+        return ParseTask(updatedMarkdown, path, parentTaskId);
+    }
+
+    /// <summary>Stores the last planning error without losing the source note; the next poll may retry.</summary>
+    public async Task SetPlanningErrorAsync(
+        string parentTaskId,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        ValidateId(parentTaskId, nameof(parentTaskId));
+        ArgumentNullException.ThrowIfNull(error);
+
+        string path = Path.Combine(GetManagedDirectory(PlanningFolder), parentTaskId, "Original.md");
+        EnsureExistingManagedDirectory(Path.GetDirectoryName(path)!, PlanningFolder, parentTaskId);
+        string markdown = await ReadMarkdownAsync(path, cancellationToken).ConfigureAwait(false);
+        MarkdownFrontmatter frontmatter = MarkdownFrontmatter.Parse(markdown);
+        string message = error.Length > 1200 ? error[..1200] : error;
+        int attempts = int.TryParse(
+            frontmatter.GetValue("planning_attempt", "0"),
+            System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out int previousAttempts)
+            ? Math.Clamp(previousAttempts, 0, 1000) + 1
+            : 1;
+        int retryDelaySeconds = Math.Min(300, 5 * (1 << Math.Min(attempts - 1, 6)));
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        frontmatter.SetValue("planning_error", message);
+        frontmatter.SetValue("planning_error_utc", now.ToString("O"));
+        frontmatter.SetValue("planning_attempt", attempts.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        frontmatter.SetValue("planning_retry_after_utc", now.AddSeconds(retryDelaySeconds).ToString("O"));
+        await WriteMarkdownAtomicAsync(path, frontmatter.ToMarkdown(), cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Moves one Inbox note into Planning/&lt;task-id&gt;/Original.md. If the note has no id,
     /// a stable id is generated and written into its Frontmatter.
@@ -160,8 +295,8 @@ public sealed class ObsidianTaskStore
 
         if (plan.Subtasks.Count == 0)
             throw new InvalidDataException("Decomposer должен создать хотя бы одну подзадачу.");
-        if (plan.Subtasks.Count > 128)
-            throw new InvalidDataException("Один план не может содержать более 128 подзадач.");
+        if (plan.Subtasks.Count > 64)
+            throw new InvalidDataException("Один план не может содержать более 64 подзадач.");
 
         string planningDirectory = Path.Combine(GetManagedDirectory(PlanningFolder), plan.ParentTaskId);
         EnsureExistingManagedDirectory(planningDirectory, PlanningFolder, plan.ParentTaskId);
@@ -173,8 +308,10 @@ public sealed class ObsidianTaskStore
         ObsidianTaskDocument originalTask = ParseTask(originalMarkdown, originalPath, plan.ParentTaskId);
         if (!string.Equals(originalTask.Id, plan.ParentTaskId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("ParentTaskId не совпадает с ID исходной Inbox-задачи.");
+        if (!string.Equals(originalTask.ContentHash, plan.OriginalContentHash, StringComparison.Ordinal))
+            throw new InvalidDataException("Исходная задача была изменена в Obsidian во время планирования. План нужно построить заново.");
 
-        ValidatePlan(plan, originalTask.WorkspaceId);
+        ValidatePlan(plan, originalTask.WorkspaceId, originalTask.DependencyPolicy);
 
         string queueRoot = GetManagedDirectory(QueueFolder);
         string publishedDirectory = Path.Combine(queueRoot, plan.ParentTaskId);
@@ -197,6 +334,11 @@ public sealed class ObsidianTaskStore
                 await WriteMarkdownAtomicAsync(taskPath, taskMarkdown, cancellationToken).ConfigureAwait(false);
             }
 
+            string latestBeforePublish = await ReadMarkdownAsync(originalPath, cancellationToken).ConfigureAwait(false);
+            string latestHash = ComputeContentHash(latestBeforePublish);
+            if (!string.Equals(latestHash, plan.OriginalContentHash, StringComparison.Ordinal))
+                throw new InvalidDataException("Исходная задача изменилась до публикации плана. Декомпозиция будет повторена.");
+
             Directory.Move(stagingDirectory, publishedDirectory);
 
             // The queue directory move is the publication commit. Re-read Original.md
@@ -205,6 +347,10 @@ public sealed class ObsidianTaskStore
             MarkdownFrontmatter parentFrontmatter = MarkdownFrontmatter.Parse(latestOriginal);
             parentFrontmatter.SetValue("status", "queued");
             parentFrontmatter.SetValue("subtask_count", plan.Subtasks.Count.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            parentFrontmatter.Remove("planning_error");
+            parentFrontmatter.Remove("planning_error_utc");
+            parentFrontmatter.Remove("planning_attempt");
+            parentFrontmatter.Remove("planning_retry_after_utc");
             await WriteMarkdownAtomicAsync(originalPath, parentFrontmatter.ToMarkdown(), CancellationToken.None)
                 .ConfigureAwait(false);
         }
@@ -514,13 +660,32 @@ public sealed class ObsidianTaskStore
             NullIfEmpty(frontmatter.GetValue("workspace")),
             NullIfEmpty(frontmatter.GetValue("parent")),
             priority,
+            ParseDependencyPolicy(frontmatter.GetValue("dependency_policy", "existing_only")),
             frontmatter.GetList("depends_on"),
             frontmatter.GetList("target_files"),
             frontmatter.GetList("requirements"),
             frontmatter.GetList("acceptance_criteria"),
             frontmatter.GetValue("status", "pending"),
-            sourcePath);
+            sourcePath,
+            ComputeContentHash(markdown));
     }
+
+    private static DependencyPolicy ParseDependencyPolicy(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "existing_only" => DependencyPolicy.ExistingOnly,
+        "allow_if_necessary" => DependencyPolicy.AllowIfNecessary,
+        "unrestricted" => DependencyPolicy.Unrestricted,
+        _ => throw new InvalidDataException(
+            $"Неизвестная dependency_policy '{value}'. Допустимые значения: existing_only, allow_if_necessary, unrestricted.")
+    };
+
+    private static string FormatDependencyPolicy(DependencyPolicy policy) => policy switch
+    {
+        DependencyPolicy.ExistingOnly => "existing_only",
+        DependencyPolicy.AllowIfNecessary => "allow_if_necessary",
+        DependencyPolicy.Unrestricted => "unrestricted",
+        _ => throw new InvalidDataException($"Неизвестная DependencyPolicy: {policy}.")
+    };
 
     private static string CreateSubtaskMarkdown(string parentTaskId, ObsidianSubtaskDefinition task)
     {
@@ -531,6 +696,7 @@ public sealed class ObsidianTaskStore
         frontmatter.Add("workspace", task.WorkspaceId);
         frontmatter.Add("title", task.Title);
         frontmatter.Add("priority", task.Priority.ToString().ToLowerInvariant());
+        frontmatter.Add("dependency_policy", FormatDependencyPolicy(task.DependencyPolicy));
         frontmatter.Add("status", "pending");
         frontmatter.Add("attempt", "0");
         frontmatter.Add("created_utc", DateTimeOffset.UtcNow.ToString("O"));
@@ -562,7 +728,10 @@ public sealed class ObsidianTaskStore
         builder.AppendLine();
     }
 
-    private static void ValidatePlan(ObsidianTaskPlan plan, string? originalWorkspaceId)
+    private static void ValidatePlan(
+        ObsidianTaskPlan plan,
+        string? originalWorkspaceId,
+        DependencyPolicy originalDependencyPolicy)
     {
         var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string? planWorkspaceId = originalWorkspaceId;
@@ -581,6 +750,11 @@ public sealed class ObsidianTaskStore
             ArgumentNullException.ThrowIfNull(task.AcceptanceCriteria);
             if (!Enum.IsDefined(task.Priority))
                 throw new InvalidDataException($"Недопустимый Priority у подзадачи '{task.Id}'.");
+            if (!Enum.IsDefined(task.DependencyPolicy))
+                throw new InvalidDataException($"Недопустимая DependencyPolicy у подзадачи '{task.Id}'.");
+            if (task.DependencyPolicy != originalDependencyPolicy)
+                throw new InvalidDataException(
+                    $"Подзадача '{task.Id}' изменила dependency_policy родительской задачи.");
             ArgumentException.ThrowIfNullOrWhiteSpace(task.Title);
             ArgumentNullException.ThrowIfNull(task.Description);
             if (string.Equals(task.Id, plan.ParentTaskId, StringComparison.OrdinalIgnoreCase))
@@ -726,18 +900,19 @@ public sealed class ObsidianTaskStore
         }
     }
 
+    private static string ComputeContentHash(string markdown) =>
+        Convert.ToHexString(SHA256.HashData(Utf8NoBom.GetBytes(markdown)));
+
     private static string CreateEmptyProjectMemory(string workspaceId) =>
         $"# Project Memory{Environment.NewLine}" +
         $"> Workspace: `{workspaceId}`{Environment.NewLine}" +
-        "> Facts must be verified against current project files when needed." + Environment.NewLine + Environment.NewLine +
-        "## Desired Outcome" + Environment.NewLine + "_Not recorded yet._" + Environment.NewLine + Environment.NewLine +
-        "## Current State" + Environment.NewLine + "_Not analyzed yet._" + Environment.NewLine + Environment.NewLine +
-        "## Completed" + Environment.NewLine + "_Nothing verified yet._" + Environment.NewLine + Environment.NewLine +
-        "## Next Steps" + Environment.NewLine + "_Not determined yet._" + Environment.NewLine + Environment.NewLine +
-        "## Architecture and Technologies" + Environment.NewLine + "_Not analyzed yet._" + Environment.NewLine + Environment.NewLine +
-        "## Important Files" + Environment.NewLine + "_Not analyzed yet._" + Environment.NewLine + Environment.NewLine +
-        "## Constraints and Decisions" + Environment.NewLine + "_Not recorded yet._" + Environment.NewLine + Environment.NewLine +
-        "## Open Questions" + Environment.NewLine + "_None recorded._" + Environment.NewLine;
+        "> Краткое состояние проекта. Технические детали проверяй в исходниках только при необходимости." + Environment.NewLine + Environment.NewLine +
+        "## Desired Outcome" + Environment.NewLine + "_Не указано._" + Environment.NewLine + Environment.NewLine +
+        "## Current State" + Environment.NewLine + "_Пока не зафиксировано._" + Environment.NewLine + Environment.NewLine +
+        "## Completed" + Environment.NewLine + "_Пока нет подтверждённых результатов._" + Environment.NewLine + Environment.NewLine +
+        "## Next Steps" + Environment.NewLine + "_Не определены._" + Environment.NewLine + Environment.NewLine +
+        "## Constraints and Decisions" + Environment.NewLine + "_Пока не зафиксированы._" + Environment.NewLine + Environment.NewLine +
+        "## Open Questions" + Environment.NewLine + "_Нет записанных вопросов._" + Environment.NewLine;
 
     private static string? FindFirstHeading(string markdown)
     {
