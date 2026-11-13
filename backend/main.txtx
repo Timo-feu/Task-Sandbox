@@ -9,6 +9,9 @@ using System.Threading.Tasks;
 
 namespace TaskSandbox;
 
+
+
+
 public readonly record struct ChatMessage(
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("content")] string Content);
