@@ -13,6 +13,18 @@
     ]
   },
   "model": {
+    "activeProfileId": "local",
+    "profiles": [
+      {
+        "id": "local",
+        "name": "LM Studio",
+        "providerId": "lm-studio",
+        "baseUrl": "http://localhost:1234/",
+        "modelId": "local-model",
+        "requestTimeoutSeconds": 300
+      }
+    ],
+    "providerId": "lm-studio",
     "baseUrl": "http://localhost:1234/",
     "modelId": "local-model",
     "requestTimeoutSeconds": 300

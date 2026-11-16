@@ -6,7 +6,12 @@ using TaskSandbox.Tools;
 
 namespace TaskSandbox.Execution;
 
-public sealed record TaskExecutionResult(string TaskId, bool Success, string ReportMarkdown, int ToolCalls);
+public sealed record TaskExecutionResult(
+    string TaskId,
+    bool Success,
+    string ReportMarkdown,
+    int ToolCalls,
+    IReadOnlyList<TaskToolTrace> ToolTrace);
 
 /// <summary>Executes one claimed task through the application's explicit JSON tool protocol.</summary>
 public sealed class TaskExecutor
@@ -39,7 +44,9 @@ public sealed class TaskExecutor
 
     public async Task<TaskExecutionResult> ExecuteAsync(
         ObsidianTaskDocument task,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? correctionFeedback = null,
+        FileRecoverySession? recoverySession = null)
     {
         ArgumentNullException.ThrowIfNull(task);
         var userTask = _contextBuilder.CreateUserTask(task, _workspaceId);
@@ -50,9 +57,17 @@ public sealed class TaskExecutor
         ModelMessage[] initialMessages = AgentPromptBuilder.BuildTaskMessages(_contextBuilder.Prompts, context);
         var messages = new List<ModelMessage>(initialMessages.Length + 16);
         messages.Add(initialMessages[0]);
-        var tools = new WorkspaceToolRegistry(_workspacePath, userTask.DependencyPolicy, _executionService, userTask.TargetFiles);
+        var tools = new WorkspaceToolRegistry(_workspacePath, userTask.DependencyPolicy, _executionService,
+            new GitService(_workspacePath), userTask.TargetFiles, recoverySession);
         messages.Add(new ModelMessage("system", tools.DescribeTools()));
         messages.Add(initialMessages[1]);
+        if (!string.IsNullOrWhiteSpace(correctionFeedback))
+        {
+            messages.Add(new ModelMessage("user",
+                "## Обратная связь ResultValidator по предыдущей попытке\n" +
+                "Предыдущий результат не прошёл проверку. Исправь перечисленные проблемы, проверь изменения инструментами и не заявляй об успехе, пока они не устранены.\n" +
+                correctionFeedback));
+        }
 
         for (int call = 0; call <= MaxToolCalls; call++)
         {
@@ -86,7 +101,7 @@ public sealed class TaskExecutor
                     }
                 }
                 report.AppendLine().AppendLine($"Инструментальных операций: {call}.");
-                return new TaskExecutionResult(task.Id, success, report.ToString(), call);
+                return new TaskExecutionResult(task.Id, success, report.ToString(), call, tools.Trace.ToArray());
             }
 
             if (type != "tool_call")

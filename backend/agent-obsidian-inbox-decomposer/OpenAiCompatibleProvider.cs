@@ -25,11 +25,13 @@ public sealed class OpenAiCompatibleProvider : IModelProvider, IModelDiscovery
     private readonly HttpClient _httpClient;
     private readonly string _model;
     private readonly TimeSpan _requestTimeout;
+    private readonly string? _apiKey;
 
     public OpenAiCompatibleProvider(
         HttpClient httpClient,
         string model,
-        TimeSpan requestTimeout)
+        TimeSpan requestTimeout,
+        string? apiKey = null)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
 
@@ -42,6 +44,7 @@ public sealed class OpenAiCompatibleProvider : IModelProvider, IModelDiscovery
         _httpClient = httpClient;
         _model = model;
         _requestTimeout = requestTimeout;
+        _apiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey.Trim();
     }
 
     public async Task<ModelDiscoveryResult> DiscoverModelsAsync(
@@ -53,6 +56,7 @@ public sealed class OpenAiCompatibleProvider : IModelProvider, IModelDiscovery
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, ModelsPath);
+            AddAuthorization(request);
             using HttpResponseMessage response = await _httpClient.SendAsync(
                 request,
                 HttpCompletionOption.ResponseHeadersRead,
@@ -144,6 +148,7 @@ public sealed class OpenAiCompatibleProvider : IModelProvider, IModelDiscovery
                 Content = JsonContent.Create(CreateWireRequest(request))
             };
             httpRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+            AddAuthorization(httpRequest);
 
             using HttpResponseMessage response = await _httpClient.SendAsync(
                 httpRequest,
@@ -167,6 +172,13 @@ public sealed class OpenAiCompatibleProvider : IModelProvider, IModelDiscovery
         {
             throw new TimeoutException("The model request timed out.", ex);
         }
+    }
+
+
+    private void AddAuthorization(HttpRequestMessage request)
+    {
+        if (_apiKey is not null)
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
     }
 
     private CancellationTokenSource CreateTimeoutSource(CancellationToken cancellationToken)

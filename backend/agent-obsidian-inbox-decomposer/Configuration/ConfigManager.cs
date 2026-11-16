@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using TaskSandbox.Models;
 
 namespace TaskSandbox.Configuration;
 
@@ -15,6 +16,7 @@ public static class ConfigManager
     private const string BackupFileName = "settings.backup.json";
     private const int MaxSettingsBytes = 256 * 1024;
     private const int MaxWorkspaces = 64;
+    private const int MaxModelProfiles = 32;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -56,7 +58,11 @@ public static class ConfigManager
             if (settings is null)
                 throw new InvalidDataException("Файл настроек не содержит JSON-объект.");
 
+            bool migrateModelProfiles = settings.Model?.Profiles is null || settings.Model.Profiles.Count == 0;
             ValidateAndNormalize(settings);
+            if (migrateModelProfiles)
+                await WriteAtomicAsync(settingsPath, settings, cancellationToken).ConfigureAwait(false);
+
             return new ConfigLoadResult(settings, settingsPath, WasCreated: false,
                 WasReset: false, BackupPath: null, ResetReason: null);
         }
@@ -75,6 +81,53 @@ public static class ConfigManager
             return new ConfigLoadResult(defaults, settingsPath, WasCreated: false,
                 WasReset: true, BackupPath: backupPath, ResetReason: exception.Message);
         }
+    }
+
+    public static async Task SaveAsync(
+        AgentSettings settings,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        ValidateAndNormalize(settings);
+        string directory = GetApplicationDirectoryPath();
+        Directory.CreateDirectory(directory);
+        await WriteAtomicAsync(Path.Combine(directory, SettingsFileName), settings, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static void NormalizeModelProfile(ModelProfileSettings profile)
+    {
+        profile.Id = (profile.Id ?? string.Empty).Trim();
+        if (!IsValidIdentifier(profile.Id) || profile.Id.Length > 80)
+            throw new InvalidDataException("Каждый профиль модели должен иметь id из латинских букв, цифр, '-' или '_'.");
+
+        profile.Name = (profile.Name ?? string.Empty).Trim();
+        if (profile.Name.Length is 0 or > 100)
+            throw new InvalidDataException($"У профиля модели '{profile.Id}' должно быть имя длиной от 1 до 100 символов.");
+
+        profile.ProviderId = (profile.ProviderId ?? "lm-studio").Trim();
+        if (!ProviderCatalog.TryGet(profile.ProviderId, out _))
+            throw new InvalidDataException($"Неизвестный providerId профиля '{profile.Id}': {profile.ProviderId}.");
+
+        profile.BaseUrl = (profile.BaseUrl ?? string.Empty).Trim();
+        if (!Uri.TryCreate(profile.BaseUrl, UriKind.Absolute, out Uri? modelUri) ||
+            modelUri is null ||
+            (modelUri.Scheme != Uri.UriSchemeHttp && modelUri.Scheme != Uri.UriSchemeHttps) ||
+            !string.IsNullOrEmpty(modelUri.UserInfo) ||
+            !string.IsNullOrEmpty(modelUri.Query) ||
+            !string.IsNullOrEmpty(modelUri.Fragment))
+        {
+            throw new InvalidDataException($"baseUrl профиля '{profile.Id}' должен быть абсолютным HTTP/HTTPS URL без логина и пароля.");
+        }
+
+        profile.BaseUrl = modelUri.AbsoluteUri.EndsWith("/", StringComparison.Ordinal)
+            ? modelUri.AbsoluteUri
+            : modelUri.AbsoluteUri + "/";
+        profile.ModelId = (profile.ModelId ?? string.Empty).Trim();
+        if (profile.ModelId.Length is 0 or > 256)
+            throw new InvalidDataException($"modelId профиля '{profile.Id}' должен содержать от 1 до 256 символов.");
+        if (profile.RequestTimeoutSeconds is < 10 or > 1800)
+            throw new InvalidDataException($"requestTimeoutSeconds профиля '{profile.Id}' должен находиться в диапазоне 10–1800.");
     }
 
     private static string GetApplicationDirectoryPath()
@@ -140,26 +193,58 @@ public static class ConfigManager
                 $"Workspace по умолчанию '{settings.Workspaces.DefaultId}' отсутствует в workspaces.registered.");
         }
 
-        settings.Model.BaseUrl = (settings.Model.BaseUrl ?? string.Empty).Trim();
-        if (!Uri.TryCreate(settings.Model.BaseUrl, UriKind.Absolute, out Uri? modelUri) ||
-            modelUri is null ||
-            (modelUri.Scheme != Uri.UriSchemeHttp && modelUri.Scheme != Uri.UriSchemeHttps) ||
-            !string.IsNullOrEmpty(modelUri.UserInfo) ||
-            !string.IsNullOrEmpty(modelUri.Query) ||
-            !string.IsNullOrEmpty(modelUri.Fragment))
+        settings.Model.Profiles ??= [];
+        settings.Model.ActiveProfileId = (settings.Model.ActiveProfileId ?? "local").Trim();
+
+        if (settings.Model.Profiles.Count > MaxModelProfiles)
+            throw new InvalidDataException($"Количество профилей модели не может превышать {MaxModelProfiles}.");
+
+        if (settings.Model.Profiles.Count == 0)
         {
-            throw new InvalidDataException("model.baseUrl должен быть абсолютным HTTP/HTTPS URL без логина и пароля.");
+            // Migrate the legacy single-connection settings into the first saved profile.
+            var migratedProfile = new ModelProfileSettings
+            {
+                Id = string.IsNullOrWhiteSpace(settings.Model.ActiveProfileId) ? "local" : settings.Model.ActiveProfileId,
+                Name = "Default connection",
+                ProviderId = settings.Model.ProviderId,
+                BaseUrl = settings.Model.BaseUrl,
+                ModelId = settings.Model.ModelId,
+                RequestTimeoutSeconds = settings.Model.RequestTimeoutSeconds
+            };
+            NormalizeModelProfile(migratedProfile);
+            settings.Model.Profiles.Add(migratedProfile);
+            settings.Model.ActiveProfileId = migratedProfile.Id;
         }
+        else
+        {
+            var profileIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (ModelProfileSettings profile in settings.Model.Profiles)
+            {
+                if (profile is null)
+                    throw new InvalidDataException("Список model.profiles содержит пустую запись.");
+                NormalizeModelProfile(profile);
+                if (!profileIds.Add(profile.Id))
+                    throw new InvalidDataException($"Профиль модели '{profile.Id}' указан более одного раза.");
+            }
 
-        settings.Model.BaseUrl = modelUri.AbsoluteUri.EndsWith("/", StringComparison.Ordinal)
-            ? modelUri.AbsoluteUri
-            : modelUri.AbsoluteUri + "/";
+            ModelProfileSettings? activeProfile = null;
+            foreach (ModelProfileSettings profile in settings.Model.Profiles)
+            {
+                if (string.Equals(profile.Id, settings.Model.ActiveProfileId, StringComparison.OrdinalIgnoreCase))
+                {
+                    activeProfile = profile;
+                    break;
+                }
+            }
 
-        settings.Model.ModelId = (settings.Model.ModelId ?? string.Empty).Trim();
-        if (settings.Model.ModelId.Length is 0 or > 256)
-            throw new InvalidDataException("model.modelId должен содержать от 1 до 256 символов.");
-        if (settings.Model.RequestTimeoutSeconds is < 10 or > 1800)
-            throw new InvalidDataException("model.requestTimeoutSeconds должен находиться в диапазоне 10–1800.");
+            if (activeProfile is null)
+                throw new InvalidDataException($"Активный профиль модели '{settings.Model.ActiveProfileId}' отсутствует в model.profiles.");
+
+            settings.Model.ProviderId = activeProfile.ProviderId;
+            settings.Model.BaseUrl = activeProfile.BaseUrl;
+            settings.Model.ModelId = activeProfile.ModelId;
+            settings.Model.RequestTimeoutSeconds = activeProfile.RequestTimeoutSeconds;
+        }
 
         settings.Prompts.DirectoryPath = NormalizeOptionalPath(
             settings.Prompts.DirectoryPath, "prompts.directoryPath");

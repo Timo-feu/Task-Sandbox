@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111418">
+    <title>TS — Task Sandbox</title>
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-mark">✧</div>
+                <div class="brand-copy">
+                    <strong>TS</strong>
+                    <span>Task Sandbox</span>
+                </div>
+                <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Свернуть меню">‹</button>
+            </div>
+
+            <div class="workspace-switcher">
+                <span class="workspace-icon">⌘</span>
+                <span class="workspace-copy">
+                    <small>WORKSPACE</small>
+                    <strong id="workspace-name">Основной проект</strong>
+                </span>
+                <span class="chevron">⌄</span>
+            </div>
+
+            <nav class="navigation" aria-label="Основная навигация">
+                <span class="nav-caption">РАБОЧЕЕ ПРОСТРАНСТВО</span>
+                <button class="nav-item active" data-page="dashboard" type="button">
+                    <span class="nav-icon">▦</span><span>Дашборд</span>
+                </button>
+                <button class="nav-item" data-page="tasks" type="button">
+                    <span class="nav-icon">☷</span><span>Задачи</span><span class="nav-count" id="nav-task-count">0</span>
+                </button>
+                <button class="nav-item" data-page="activity" type="button">
+                    <span class="nav-icon">◷</span><span>Активность</span>
+                </button>
+
+                <span class="nav-caption nav-caption-spaced">СИСТЕМА</span>
+                <button class="nav-item" data-page="models" type="button">
+                    <span class="nav-icon">✧</span><span>Модели и провайдеры</span>
+                </button>
+                <button class="nav-item" data-page="settings" type="button">
+                    <span class="nav-icon">⚙</span><span>Настройки</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-bottom">
+                <div class="agent-indicator"><span class="indicator-dot"></span><span id="agent-state">Подключение…</span></div>
+                <div class="sidebar-version">TS Desktop <span>v0.1</span></div>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="topbar">
+                <div>
+                    <div class="eyebrow">TASK SANDBOX / OVERVIEW / V1</div>
+                    <h1 id="page-title">Дашборд</h1>
+                    <p class="page-subtitle">Состояние автономного агента в реальном времени</p>
+                </div>
+                <div class="topbar-actions">
+                    <span class="connection-status" id="online"><span class="indicator-dot"></span>Проверка</span>
+                    <button class="icon-button" id="refresh" type="button" title="Обновить данные">↻</button>
+                </div>
+            </header>
+
+            <section id="page-dashboard" class="page-section">
+                <div class="metric-grid">
+                    <article class="metric-card">
+                        <div class="metric-heading"><span>Выполнено сегодня</span><span class="metric-icon purple">✓</span></div>
+                        <div class="metric-value" id="completed-today">—</div>
+                        <div class="metric-foot">Задачи в Completed за сегодня</div>
+                    </article>
+                    <article class="metric-card">
+                        <div class="metric-heading"><span>Активность</span><span class="metric-icon cyan">⌁</span></div>
+                        <div class="metric-value" id="activity">—</div>
+                        <div class="metric-foot">Будет рассчитана по событиям агента</div>
+                    </article>
+                    <article class="metric-card">
+                        <div class="metric-heading"><span>Ошибки сегодня</span><span class="metric-icon amber">!</span></div>
+                        <div class="metric-value danger-text" id="errors">—</div>
+                        <div class="metric-foot">Ошибки выполнения и проверки</div>
+                    </article>
+                    <article class="metric-card">
+                        <div class="metric-heading"><span>Исправления сегодня</span><span class="metric-icon green">↗</span></div>
+                        <div class="metric-value" id="fixes">—</div>
+                        <div class="metric-foot">Успешные циклы самокоррекции</div>
+                    </article>
+                </div>
+
+                <div class="content-grid">
+                    <article class="panel current-task-panel">
+                        <div class="panel-heading">
+                            <div><span class="eyebrow">В ПРОЦЕССЕ</span><h2>Текущая задача</h2></div>
+                            <span class="state-pill" id="task-state">Ожидание</span>
+                        </div>
+                        <h3 class="current-task-title" id="current-title">Ожидание новой задачи</h3>
+                        <p class="muted-text" id="current-meta">Агент ожидает работу из очереди</p>
+                        <div class="progress-track"><span id="task-progress"></span></div>
+                        <div class="progress-caption" id="task-progress-label">Прогресс появится после подключения событий выполнения</div>
+                    </article>
+
+                    <article class="panel model-panel">
+                        <div class="panel-heading">
+                            <div><span class="eyebrow">ACTIVE CONNECTION</span><h2>Модель</h2></div>
+                            <span class="model-spark">✧</span>
+                        </div>
+                        <div class="provider-name" id="model-provider">—</div>
+                        <div class="muted-text model-id" id="model-id">Модель не выбрана</div>
+                        <div class="model-divider"></div>
+                        <div class="quick-stats">
+                            <div><span>Inbox</span><strong id="count-inbox">0</strong></div>
+                            <div><span>В очереди</span><strong id="count-queue">0</strong></div>
+                            <div><span>Завершено</span><strong id="count-done">0</strong></div>
+                            <div><span>Неудачно</span><strong id="count-failed">0</strong></div>
+                        </div>
+                    </article>
+                </div>
+
+                <article class="panel recent-panel">
+                    <div class="panel-heading"><div><span class="eyebrow">WORK QUEUE</span><h2>Последние задачи</h2></div><button class="text-button" data-open-page="tasks" type="button">Все задачи →</button></div>
+                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th></tr></thead><tbody id="recent-tasks-body"></tbody></table></div>
+                </article>
+            </section>
+
+            <section id="page-tasks" class="page-section hidden">
+                <article class="panel">
+                    <div class="panel-heading"><div><span class="eyebrow">TASK MANAGEMENT</span><h2>Задачи</h2></div><span class="muted-text" id="task-count">0 задач</span></div>
+                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th></tr></thead><tbody id="tasks-body"></tbody></table></div>
+                </article>
+            </section>
+
+            <section id="page-activity" class="page-section hidden">
+                <article class="panel empty-state"><div class="empty-state-icon">◷</div><h2>История активности</h2><p>Здесь появятся события планирования, выполнения инструментов, ошибок и исправлений после подключения журнала runtime.</p></article>
+            </section>
+
+            <section id="page-models" class="page-section hidden">
+                <div class="page-intro"><span class="eyebrow">MODEL CONNECTIONS</span><h2>Модели и провайдеры</h2><p>Сохранённые подключения и активная модель агента.</p></div>
+                <div class="profile-grid" id="profiles"></div>
+            </section>
+
+            <section id="page-settings" class="page-section hidden">
+                <div class="page-intro"><span class="eyebrow">CONFIGURATION</span><h2>Настройки</h2><p>Рабочие пространства и подключение Obsidian.</p></div>
+                <div class="settings-grid">
+                    <article class="panel"><div class="panel-heading"><h2>Рабочие пространства</h2></div><div id="workspaces"></div></article>
+                    <article class="panel"><div class="panel-heading"><h2>Obsidian</h2></div><div class="setting-label">Путь к хранилищу</div><div class="setting-value" id="vault-path">Не настроен</div></article>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="/js/app.js" defer></script>
+</body>
+</html>

@@ -13,7 +13,8 @@ public static class PromptLoader
     [
         "SystemPrompt.md",
         "TaskPlanningPrompt.md",
-        "TaskExecutionPrompt.md"
+        "TaskExecutionPrompt.md",
+        "ProjectMemoryUpdatePrompt.md"
     ];
 
     public static async Task<PromptSet> LoadAsync(
@@ -29,6 +30,8 @@ public static class PromptLoader
             Path.Combine(resolvedDirectory, PromptFiles[1]), cancellationToken).ConfigureAwait(false);
         string taskExecutionPrompt = await ReadPromptAsync(
             Path.Combine(resolvedDirectory, PromptFiles[2]), cancellationToken).ConfigureAwait(false);
+        string projectMemoryUpdatePrompt = await ReadPromptAsync(
+            Path.Combine(resolvedDirectory, PromptFiles[3]), cancellationToken).ConfigureAwait(false);
 
         (string systemPrompt, PromptFeatures features) = ExtractFlags(systemPromptWithFlags);
 
@@ -44,6 +47,7 @@ public static class PromptLoader
             systemPrompt,
             taskPlanningPrompt,
             taskExecutionPrompt,
+            projectMemoryUpdatePrompt,
             features);
     }
 

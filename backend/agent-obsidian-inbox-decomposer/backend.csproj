@@ -5,9 +5,21 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Desktop is a nested, independent WinForms project. Exclude its entire tree
+         from this backend project's SDK default item globs, including nested obj/bin. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);Desktop/**;Desktop\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Remove="tests/**/*.cs" />
+    <!-- The backend project is at the repository root. Exclude the nested WinForms
+         desktop project and its generated obj/*.cs files from backend compilation. -->
+    <Compile Remove="Desktop/**/*.cs;Desktop\**\*.cs" />
     <None Update="PromptTemplates\*.md" CopyToOutputDirectory="PreserveNewest" />
     <None Update="Templates\*.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

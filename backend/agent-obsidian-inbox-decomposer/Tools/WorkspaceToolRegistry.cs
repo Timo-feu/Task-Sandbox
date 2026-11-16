@@ -6,6 +6,14 @@ namespace TaskSandbox.Tools;
 
 public sealed record ToolExecutionResult(bool Success, string Output);
 
+public sealed record TaskToolTrace(
+    string Tool,
+    bool Success,
+    string? Path = null,
+    int? ExitCode = null,
+    bool TimedOut = false,
+    string? Detail = null);
+
 /// <summary>Small, allow-listed set of file tools restricted to one Workspace.</summary>
 public sealed class WorkspaceToolRegistry
 {
@@ -19,12 +27,19 @@ public sealed class WorkspaceToolRegistry
     private readonly DependencyPolicy _dependencyPolicy;
     private readonly string[] _allowedWritePaths;
     private readonly ExecutionService _executionService;
+    private readonly GitService _gitService;
+    private readonly FileRecoverySession? _recoverySession;
+    private readonly List<TaskToolTrace> _trace = [];
+
+    public IReadOnlyList<TaskToolTrace> Trace => _trace;
 
     public WorkspaceToolRegistry(
         string workspacePath,
         DependencyPolicy dependencyPolicy,
         ExecutionService executionService,
-        IReadOnlyList<string>? allowedWritePaths = null)
+        GitService gitService,
+        IReadOnlyList<string>? allowedWritePaths = null,
+        FileRecoverySession? recoverySession = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workspacePath);
         _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workspacePath));
@@ -33,6 +48,8 @@ public sealed class WorkspaceToolRegistry
         _rootPrefix = _root + Path.DirectorySeparatorChar;
         _dependencyPolicy = dependencyPolicy;
         _executionService = executionService ?? throw new ArgumentNullException(nameof(executionService));
+        _gitService = gitService ?? throw new ArgumentNullException(nameof(gitService));
+        _recoverySession = recoverySession;
         _allowedWritePaths = allowedWritePaths?.Where(static path => !string.IsNullOrWhiteSpace(path))
             .Select(NormalizeRelativePath).ToArray() ?? [];
         for (DirectoryInfo? current = new DirectoryInfo(_root); current is not null; current = current.Parent)
@@ -43,11 +60,15 @@ public sealed class WorkspaceToolRegistry
         Доступные инструменты (вызывай строго по одному):
         - list_files: {"path":"относительный/каталог"} — список файлов и папок; path необязателен, по умолчанию корень.
         - read_file: {"path":"относительный/файл"} — чтение UTF-8 файла.
-        - write_file: {"path":"относительный/файл","content":"полное содержимое"} — создание или полная перезапись файла.
-        - dotnet_build: {"project":"relative/path.csproj","configuration":"Debug"} — dotnet build. project необязателен, но если в корне несколько проектов, укажи путь.
-        - dotnet_test: {"project":"relative/path.csproj","configuration":"Debug"} — dotnet test. project необязателен, но если в корне несколько проектов, укажи путь.
+        - write_file: {"path":"относительный/файл","content":"полное содержимое"} — создание или полная перезапись файла. Исходная версия автоматически сохраняется для отката задачи.
+        - project_build: {"project":"relative/project-directory","configuration":"Debug"} — сборка по автоматически определённому профилю проекта.
+        - project_test: {"project":"relative/project-directory","configuration":"Debug"} — тесты по автоматически определённому профилю проекта.
+        - git_status: {} — краткий статус Git-репозитория (только чтение).
+        - git_diff: {} — diff индексированных и отслеживаемых неиндексированных изменений (только чтение; untracked-файлы видны в git_status).
+        Git-инструменты доступны только для чтения. Создание коммитов выполняется отдельно пользователем через CLI с явным списком путей. Push и сетевые Git-операции недоступны.
+        Поддерживаемые профили: .NET, Node.js (npm/pnpm/yarn), Python, Go, Rust, Java (Maven/Gradle). Команды выбираются приложением по manifest-файлам; произвольные команды и shell не поддерживаются.
+        project необязателен: по умолчанию используется корень Workspace. Если проект находится в подкаталоге, укажи относительный путь к нему.
         Если задача содержит target_files, изменяй только перечисленные пути или файлы внутри перечисленных каталогов.
-        Для сборки/тестов разрешены только dotnet build и dotnet test. Никакие произвольные shell-команды не поддерживаются.
         Не используй абсолютные пути, '..', ссылки и пути вне Workspace. Не удаляй файлы: такого инструмента нет.
         Для завершения верни {"type":"final","summary":"что сделано","checks":["что проверено"]}.
         Для инструмента верни {"type":"tool_call","tool":"имя","arguments":{...}}.
@@ -60,33 +81,52 @@ public sealed class WorkspaceToolRegistry
     {
         try
         {
-            if (tool is "dotnet_build" or "dotnet_test")
+            if (tool is "git_status" or "git_diff")
+            {
+                GitCommandResult git = tool == "git_status"
+                    ? await _gitService.GetStatusAsync(cancellationToken).ConfigureAwait(false)
+                    : await _gitService.GetDiffAsync(cancellationToken).ConfigureAwait(false);
+                _trace.Add(new TaskToolTrace(tool, git.Success, Detail: git.Success ? null : git.Output));
+                return new ToolExecutionResult(git.Success, git.Output);
+            }
+
+            if (tool is "project_build" or "project_test" or "dotnet_build" or "dotnet_test")
             {
                 ProcessExecutionResult process = await _executionService
                     .ExecuteAsync(tool, arguments, cancellationToken).ConfigureAwait(false);
                 string status = process.TimedOut ? "TIMEOUT" : process.ExitCode?.ToString() ?? "NO_EXIT_CODE";
-                string output = $"Статус: {status}; длительность: {process.Duration.TotalSeconds:0.0} сек.; " +
+                string output = $"Профиль: {process.Profile}; статус: {status}; длительность: {process.Duration.TotalSeconds:0.0} сек.; " +
                                 $"код завершения: {process.ExitCode?.ToString() ?? "нет"}.\n{process.Output}";
+                _trace.Add(new TaskToolTrace(tool, process.Success, ExitCode: process.ExitCode,
+                    TimedOut: process.TimedOut, Detail: process.Success ? null : output));
                 return new ToolExecutionResult(process.Success, output);
             }
 
-            return tool switch
+            ToolExecutionResult result = tool switch
             {
                 "list_files" => ListFiles(GetString(arguments, "path", required: false) ?? string.Empty),
                 "read_file" => ReadFile(GetString(arguments, "path")!),
                 "write_file" => WriteFile(GetString(arguments, "path")!, GetString(arguments, "content")!),
                 _ => new ToolExecutionResult(false, $"Неизвестный инструмент '{tool}'.")
             };
+            string? path = tool == "write_file" && result.Success
+                ? NormalizeRelativePath(GetString(arguments, "path")!)
+                : null;
+            _trace.Add(new TaskToolTrace(tool, result.Success, path,
+                Detail: result.Success ? null : result.Output));
+            return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or
                                           ArgumentException or InvalidDataException or NotSupportedException or
                                           System.ComponentModel.Win32Exception)
         {
-            return new ToolExecutionResult(false, $"{exception.GetType().Name}: {exception.Message}");
+            string error = $"{exception.GetType().Name}: {exception.Message}";
+            _trace.Add(new TaskToolTrace(tool, false, Detail: error));
+            return new ToolExecutionResult(false, error);
         }
     }
 
@@ -149,7 +189,10 @@ public sealed class WorkspaceToolRegistry
         if (File.Exists(path))
             EnsureNoReparsePoint(path);
 
+        _recoverySession?.CaptureBeforeWrite(Path.GetRelativePath(_root, path), path);
+
         string temporaryPath = path + ".agent-tmp-" + Guid.NewGuid().ToString("N");
+        _recoverySession?.CaptureBeforeWrite(Path.GetRelativePath(_root, temporaryPath), temporaryPath);
         try
         {
             File.WriteAllBytes(temporaryPath, bytes);

@@ -4,6 +4,8 @@ using TaskSandbox.Inbox;
 using TaskSandbox.Obsidian;
 using TaskSandbox.Planning;
 using TaskSandbox.Prompting;
+using TaskSandbox.Models;
+using TaskSandbox.Web;
 
 namespace TaskSandbox;
 
@@ -27,11 +29,8 @@ public static class Program
             AgentSettings settings = configResult.Settings;
             ReportConfigurationLoad(configResult);
 
-            PromptSet prompts = await PromptLoader.LoadAsync(
-                settings.Prompts.DirectoryPath,
-                cancellationToken).ConfigureAwait(false);
-            Console.WriteLine($"[Prompts] Markdown-промпты загружены: {prompts.DirectoryPath}");
-            Console.WriteLine($"[Prompts] TaskPlanningPrompt: {prompts.TaskPlanningPrompt.Length:N0} символов");
+            if (await HandleModelProfileCommandAsync(args, settings, cancellationToken).ConfigureAwait(false))
+                return;
 
             if (!TryGetConfiguredWorkspace(settings, out WorkspaceEntry? workspace) || workspace is null)
             {
@@ -44,17 +43,55 @@ public static class Program
             string workspacePath = workspace.Path;
             string workspaceId = workspace.Id;
 
-            if (!Directory.Exists(vaultPath))
-            {
-                Console.WriteLine($"[Setup] Obsidian Vault не найден: {vaultPath}");
-                Console.WriteLine($"[Setup] Исправьте Obsidian.VaultPath в {configResult.SettingsPath}");
-                return;
-            }
-
             if (!Directory.Exists(workspacePath))
             {
                 Console.WriteLine($"[Setup] Workspace не найден: {workspacePath}");
                 Console.WriteLine($"[Setup] Исправьте путь Workspace '{workspaceId}' в {configResult.SettingsPath}");
+                return;
+            }
+
+            if (args.Contains("--git-status", StringComparer.OrdinalIgnoreCase) ||
+                args.Contains("--git-diff", StringComparer.OrdinalIgnoreCase) ||
+                args.Contains("--git-commit", StringComparer.OrdinalIgnoreCase))
+            {
+                var git = new GitService(workspacePath);
+                GitCommandResult gitResult;
+                if (args.Contains("--git-status", StringComparer.OrdinalIgnoreCase))
+                {
+                    gitResult = await git.GetStatusAsync(cancellationToken).ConfigureAwait(false);
+                }
+                else if (args.Contains("--git-diff", StringComparer.OrdinalIgnoreCase))
+                {
+                    gitResult = await git.GetDiffAsync(cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    string? message = GetOptionValue(args, "--message");
+                    string[] paths = GetOptionValues(args, "--path");
+                    if (string.IsNullOrWhiteSpace(message) || paths.Length == 0)
+                    {
+                        Console.Error.WriteLine("Использование коммита: --git-commit --message \"сообщение\" --path relative/file [--path another/file]");
+                        Environment.ExitCode = 2;
+                        return;
+                    }
+                    gitResult = await git.CommitAsync(message, paths, cancellationToken).ConfigureAwait(false);
+                }
+
+                Console.WriteLine(gitResult.Output);
+                if (!gitResult.Success) Environment.ExitCode = 1;
+                return;
+            }
+
+            PromptSet prompts = await PromptLoader.LoadAsync(
+                settings.Prompts.DirectoryPath,
+                cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"[Prompts] Markdown-промпты загружены: {prompts.DirectoryPath}");
+            Console.WriteLine($"[Prompts] TaskPlanningPrompt: {prompts.TaskPlanningPrompt.Length:N0} символов");
+
+            if (!Directory.Exists(vaultPath))
+            {
+                Console.WriteLine($"[Setup] Obsidian Vault не найден: {vaultPath}");
+                Console.WriteLine($"[Setup] Исправьте Obsidian.VaultPath в {configResult.SettingsPath}");
                 return;
             }
 
@@ -78,12 +115,33 @@ public static class Program
                 Timeout = Timeout.InfiniteTimeSpan
             };
 
-            TimeSpan requestTimeout = TimeSpan.FromSeconds(settings.Model.RequestTimeoutSeconds);
-            IModelProvider modelProvider = await CreateModelProviderAsync(
-                httpClient,
-                settings.Model.ModelId,
-                requestTimeout,
-                cancellationToken).ConfigureAwait(false);
+            var modelProviderFactory = new ModelProviderFactory();
+            ProviderDefinition providerDefinition = ProviderCatalog.GetRequired(settings.Model.ProviderId);
+            Console.WriteLine($"[Model] Профиль: {settings.Model.ActiveProfileId}");
+            Console.WriteLine($"[Model] Провайдер: {providerDefinition.Name}");
+            Console.WriteLine($"[Model] Endpoint: {settings.Model.BaseUrl}");
+
+            var secretStore = new WindowsCredentialSecretStore();
+            string? apiKey = secretStore.Get(
+                ModelProfileService.GetCredentialTarget(settings.Model.ActiveProfileId));
+            if (providerDefinition.RequiresApiKey && string.IsNullOrWhiteSpace(apiKey))
+            {
+                Console.Error.WriteLine(
+                    $"[Model] Для профиля '{settings.Model.ActiveProfileId}' не задан API-ключ. " +
+                    "Сохраните его командой --model-key-set.");
+                Environment.ExitCode = 2;
+                return;
+            }
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                Console.WriteLine("[Model] API-ключ: установлен в Windows Credential Manager.");
+
+            IModelProvider discoveryProvider = modelProviderFactory.Create(settings.Model, httpClient, apiKey);
+            string selectedModelId = await DiscoverConfiguredModelsAsync(
+                discoveryProvider, settings.Model.ModelId, cancellationToken).ConfigureAwait(false);
+            if (!string.Equals(selectedModelId, settings.Model.ModelId, StringComparison.Ordinal))
+                settings.Model.ModelId = selectedModelId;
+
+            IModelProvider modelProvider = modelProviderFactory.Create(settings.Model, httpClient, apiKey);
 
             var taskStore = new ObsidianTaskStore(new ObsidianTaskStoreOptions
             {
@@ -110,10 +168,20 @@ public static class Program
                 modelProvider, taskContextBuilder, workspaceId, workspacePath,
                 TimeSpan.FromSeconds(settings.Runtime.ProcessTimeoutSeconds),
                 settings.Runtime.MaxProcessOutputCharacters);
-            var queueWorker = new QueueWorker(taskStore, executor, new QueueWorkerOptions
+            var validator = new ResultValidator(workspacePath);
+            var recoveryStore = new WorkspaceRecoveryStore(workspacePath);
+            int recoveredFiles = recoveryStore.RecoverInterruptedSessions();
+            if (recoveredFiles > 0)
+                Console.WriteLine($"[Recovery] Восстановлено прерванных файловых транзакций: {recoveredFiles}.");
+            var executionPipeline = new SelfCorrectionEngine(
+                executor, validator, settings.Runtime.MaxCorrectionAttempts, recoveryStore);
+            ProjectMemoryUpdater? memoryUpdater = (prompts.Features & PromptFeatures.Memory) != 0
+                ? new ProjectMemoryUpdater(modelProvider, taskStore, prompts.ProjectMemoryUpdatePrompt)
+                : null;
+            var queueWorker = new QueueWorker(taskStore, executionPipeline, new QueueWorkerOptions
             {
                 PollInterval = TimeSpan.FromSeconds(settings.Runtime.InboxPollIntervalSeconds)
-            });
+            }, memoryUpdater);
             var runtime = new AgentRuntime(
                 taskStore,
                 inboxProcessor,
@@ -126,17 +194,147 @@ public static class Program
                 return;
             }
 
-            await runtime.RunAsync(cancellationToken).ConfigureAwait(false);
+            Task runtimeTask = runtime.RunAsync(cancellationToken);
+            Task webTask = WebDashboardHost.RunAsync(settings, cancellationToken);
+            await Task.WhenAll(runtimeTask, webTask).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             Console.WriteLine("[System] Получена команда остановки.");
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                          InvalidOperationException or System.ComponentModel.Win32Exception or
+                                          NotSupportedException or ArgumentException or KeyNotFoundException or
+                                          InvalidDataException)
         {
             Console.Error.WriteLine($"[Fatal] {exception.Message}");
             Environment.ExitCode = 1;
         }
+    }
+
+    private static async Task<bool> HandleModelProfileCommandAsync(
+        string[] args,
+        AgentSettings settings,
+        CancellationToken cancellationToken)
+    {
+        bool listProfiles = args.Contains("--model-profiles", StringComparer.OrdinalIgnoreCase);
+        bool addProfile = args.Contains("--model-profile-add", StringComparer.OrdinalIgnoreCase);
+        bool useProfile = args.Contains("--model-use", StringComparer.OrdinalIgnoreCase);
+        bool setKey = args.Contains("--model-key-set", StringComparer.OrdinalIgnoreCase);
+        bool deleteKey = args.Contains("--model-key-delete", StringComparer.OrdinalIgnoreCase);
+        if (!listProfiles && !addProfile && !useProfile && !setKey && !deleteKey)
+            return false;
+
+        var secretStore = new WindowsCredentialSecretStore();
+        var profileService = new ModelProfileService(settings, secretStore);
+
+        if (listProfiles)
+        {
+            foreach (ModelProfileSettings profile in profileService.Profiles)
+            {
+                bool active = string.Equals(profile.Id, profileService.ActiveProfileId, StringComparison.OrdinalIgnoreCase);
+                bool hasKey = profileService.HasApiKey(profile.Id);
+                Console.WriteLine($"{(active ? "*" : " ")} {profile.Id} | {profile.Name} | {profile.ProviderId} | {profile.ModelId} | API key: {(hasKey ? "set" : "not set")}");
+            }
+            return true;
+        }
+
+        if (addProfile)
+        {
+            string? profileId = GetOptionValue(args, "--profile-id");
+            string? providerId = GetOptionValue(args, "--provider");
+            string? modelId = GetOptionValue(args, "--model-id");
+            if (string.IsNullOrWhiteSpace(profileId) || string.IsNullOrWhiteSpace(providerId) ||
+                string.IsNullOrWhiteSpace(modelId))
+            {
+                throw new InvalidOperationException(
+                    "Создание профиля: --model-profile-add --profile-id <id> --provider <providerId> --model-id <modelId> [--name <name>] [--base-url <url>].");
+            }
+
+            ProviderDefinition definition = ProviderCatalog.GetRequired(providerId);
+            string name = GetOptionValue(args, "--name") ?? definition.Name;
+            ModelProfileSettings profile = ModelProfileService.CreateProfile(profileId, name, providerId);
+            profile.ModelId = modelId;
+            profile.BaseUrl = GetOptionValue(args, "--base-url") ?? profile.BaseUrl;
+            await profileService.SaveProfileAsync(profile, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            Console.WriteLine($"[Model] Создан профиль '{profile.Id}' ({profile.ProviderId}).");
+            return true;
+        }
+
+        if (useProfile)
+        {
+            string? profileId = GetOptionValue(args, "--model-use");
+            if (string.IsNullOrWhiteSpace(profileId))
+                profileId = GetOptionValue(args, "--profile");
+            if (string.IsNullOrWhiteSpace(profileId))
+                throw new InvalidOperationException("Укажите ID профиля: --model-use <profileId>.");
+
+            await profileService.ActivateProfileAsync(profileId, cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"[Model] Активирован профиль: {profileId}");
+            return true;
+        }
+
+        string targetProfileId = GetOptionValue(args, "--profile") ?? profileService.ActiveProfileId;
+        if (setKey)
+        {
+            Console.Write($"Введите API-ключ для профиля '{targetProfileId}' (ввод скрыт): ");
+            string secret = ReadHiddenInput();
+            if (string.IsNullOrWhiteSpace(secret))
+                throw new InvalidOperationException("Пустой API-ключ не сохранён.");
+            profileService.SetApiKey(targetProfileId, secret);
+            Console.WriteLine("[Model] API-ключ сохранён в Windows Credential Manager.");
+            return true;
+        }
+
+        profileService.DeleteApiKey(targetProfileId);
+        Console.WriteLine($"[Model] API-ключ профиля '{targetProfileId}' удалён.");
+        return true;
+    }
+
+    private static string ReadHiddenInput()
+    {
+        var value = new System.Text.StringBuilder(128);
+        while (true)
+        {
+            ConsoleKeyInfo key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter)
+            {
+                Console.WriteLine();
+                return value.ToString();
+            }
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (value.Length > 0)
+                    value.Length--;
+                continue;
+            }
+            if (!char.IsControl(key.KeyChar))
+                value.Append(key.KeyChar);
+        }
+    }
+
+    private static string? GetOptionValue(string[] args, string option)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (string.Equals(args[i], option, StringComparison.OrdinalIgnoreCase) &&
+                !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                return args[i + 1];
+        }
+        return null;
+    }
+
+    private static string[] GetOptionValues(string[] args, string option)
+    {
+        var values = new List<string>();
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (string.Equals(args[i], option, StringComparison.OrdinalIgnoreCase) &&
+                !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                values.Add(args[i + 1]);
+        }
+        return values.ToArray();
     }
 
     private static void ReportConfigurationLoad(ConfigLoadResult result)
@@ -180,13 +378,13 @@ public static class Program
         return false;
     }
 
-    private static async Task<IModelProvider> CreateModelProviderAsync(
-        HttpClient httpClient,
+    private static async Task<string> DiscoverConfiguredModelsAsync(
+        IModelProvider provider,
         string preferredModel,
-        TimeSpan requestTimeout,
         CancellationToken cancellationToken)
     {
-        var discoveryProvider = new OpenAiCompatibleProvider(httpClient, preferredModel, requestTimeout);
+        if (provider is not IModelDiscovery discoveryProvider)
+            return preferredModel;
 
         ModelDiscoveryResult discovery;
         try
@@ -200,28 +398,39 @@ public static class Program
         catch (Exception exception) when (exception is HttpRequestException or TimeoutException or
                                           System.Text.Json.JsonException or InvalidDataException)
         {
-            Console.WriteLine(
-                $"[Models] Discovery недоступен ({exception.Message}). Используется настроенная модель: {preferredModel}");
-            return discoveryProvider;
+            Console.WriteLine($"[Models] Discovery недоступен ({exception.Message}). Используется модель: {preferredModel}");
+            return preferredModel;
         }
 
         if (!discovery.IsSupported || discovery.Models.Count == 0)
         {
             Console.WriteLine("[Models] Список моделей недоступен. Используется настроенная модель: " + preferredModel);
-            return discoveryProvider;
+            return preferredModel;
         }
 
-        ModelInfo selectedModel = discovery.Models[0];
+        string selectedModelId = preferredModel;
+        bool found = false;
         foreach (ModelInfo model in discovery.Models)
         {
-            Console.WriteLine(
-                $"[Models] {model.Id}{(string.IsNullOrWhiteSpace(model.OwnedBy) ? string.Empty : $" ({model.OwnedBy})")}");
+            Console.WriteLine($"[Models] {model.Id}{(string.IsNullOrWhiteSpace(model.OwnedBy) ? string.Empty : $" ({model.OwnedBy})")}");
             if (string.Equals(model.Id, preferredModel, StringComparison.Ordinal))
-                selectedModel = model;
+            {
+                found = true;
+                selectedModelId = model.Id;
+            }
         }
 
-        Console.WriteLine($"[Models] Выбрана модель: {selectedModel.Id}");
-        return new OpenAiCompatibleProvider(httpClient, selectedModel.Id, requestTimeout);
+        if (!found)
+        {
+            selectedModelId = discovery.Models[0].Id;
+            Console.WriteLine($"[Models] Модель '{preferredModel}' не найдена. Автоматически выбрана первая доступная: {selectedModelId}");
+        }
+        else
+        {
+            Console.WriteLine($"[Models] Выбрана модель: {selectedModelId}");
+        }
+
+        return selectedModelId;
     }
 
     private static bool PathsOverlap(string left, string right)

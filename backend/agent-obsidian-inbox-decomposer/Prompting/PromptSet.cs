@@ -5,4 +5,5 @@ public sealed record PromptSet(
     string SystemPrompt,
     string TaskPlanningPrompt,
     string TaskExecutionPrompt,
+    string ProjectMemoryUpdatePrompt,
     PromptFeatures Features);

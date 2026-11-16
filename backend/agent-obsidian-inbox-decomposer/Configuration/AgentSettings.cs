@@ -17,7 +17,6 @@ public sealed class AgentSettings
 
 public sealed class ObsidianSettings
 {
-    /// <summary>Absolute path to the user's existing Obsidian vault. Empty until configured.</summary>
     public string VaultPath { get; set; } = string.Empty;
 }
 
@@ -33,8 +32,28 @@ public sealed class WorkspaceEntry
     public string Path { get; set; } = string.Empty;
 }
 
+/// <summary>
+/// Active model connection plus saved connection profiles. The flat properties are
+/// retained for compatibility with existing runtime components and old settings files.
+/// API keys are never stored here; only profile identifiers are persisted.
+/// </summary>
 public sealed class ModelSettings
 {
+    public string ActiveProfileId { get; set; } = "local";
+    public List<ModelProfileSettings> Profiles { get; set; } = [];
+
+    // Active-profile projection kept for source and settings compatibility.
+    public string ProviderId { get; set; } = "lm-studio";
+    public string BaseUrl { get; set; } = "http://localhost:1234/";
+    public string ModelId { get; set; } = "local-model";
+    public int RequestTimeoutSeconds { get; set; } = 300;
+}
+
+public sealed class ModelProfileSettings
+{
+    public string Id { get; set; } = "local";
+    public string Name { get; set; } = "Local model";
+    public string ProviderId { get; set; } = "lm-studio";
     public string BaseUrl { get; set; } = "http://localhost:1234/";
     public string ModelId { get; set; } = "local-model";
     public int RequestTimeoutSeconds { get; set; } = 300;
@@ -42,7 +61,6 @@ public sealed class ModelSettings
 
 public sealed class PromptSettings
 {
-    /// <summary>Optional custom directory. Empty means %LOCALAPPDATA%\LocalCodingAgent\Prompts.</summary>
     public string? DirectoryPath { get; set; }
 }
 
