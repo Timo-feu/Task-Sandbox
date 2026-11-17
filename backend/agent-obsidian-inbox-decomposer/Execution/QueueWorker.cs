@@ -15,13 +15,15 @@ public sealed class QueueWorker
     private readonly SelfCorrectionEngine _executionPipeline;
     private readonly QueueWorkerOptions _options;
     private readonly ProjectMemoryUpdater? _memoryUpdater;
+    private readonly RuntimeEventJournal? _journal;
 
-    public QueueWorker(ObsidianTaskStore taskStore, SelfCorrectionEngine executionPipeline, QueueWorkerOptions options, ProjectMemoryUpdater? memoryUpdater = null)
+    public QueueWorker(ObsidianTaskStore taskStore, SelfCorrectionEngine executionPipeline, QueueWorkerOptions options, ProjectMemoryUpdater? memoryUpdater = null, RuntimeEventJournal? journal = null)
     {
         _taskStore = taskStore ?? throw new ArgumentNullException(nameof(taskStore));
         _executionPipeline = executionPipeline ?? throw new ArgumentNullException(nameof(executionPipeline));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _memoryUpdater = memoryUpdater;
+        _journal = journal;
         if (options.PollInterval < TimeSpan.FromSeconds(1) || options.PollInterval > TimeSpan.FromMinutes(5))
             throw new ArgumentOutOfRangeException(nameof(options));
     }
@@ -38,6 +40,7 @@ public sealed class QueueWorker
                 return processed;
 
             Console.WriteLine($"[Executor] Начата задача '{task.Id}': {task.Title}");
+            if (_journal is not null) await _journal.WriteAsync("task_started", "Задача взята в работу", task.Title, task.Id, cancellationToken: CancellationToken.None).ConfigureAwait(false);
             try
             {
                 TaskExecutionResult result = await _executionPipeline.ExecuteAsync(task, cancellationToken)
@@ -66,12 +69,14 @@ public sealed class QueueWorker
                     await _taskStore.CompleteTaskAsync(task.Id, result.ReportMarkdown, cancellationToken)
                         .ConfigureAwait(false);
                     Console.WriteLine($"[Executor] Задача '{task.Id}' завершена. Вызовов инструментов: {result.ToolCalls}.");
+                    if (_journal is not null) await _journal.WriteAsync("task_completed", "Задача завершена", $"Вызовов инструментов: {result.ToolCalls}", task.Id, cancellationToken: CancellationToken.None).ConfigureAwait(false);
                 }
                 else
                 {
                     await _taskStore.FailTaskAsync(task.Id, result.ReportMarkdown, cancellationToken)
                         .ConfigureAwait(false);
                     Console.WriteLine($"[Executor] Задача '{task.Id}' остановлена моделью как невыполнимая.");
+                    if (_journal is not null) await _journal.WriteAsync("task_failed", "Задача не выполнена", "Модель вернула отрицательный результат или проверка не пройдена", task.Id, "error", CancellationToken.None).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -84,6 +89,7 @@ public sealed class QueueWorker
                                 "Задача перемещена в Failed. После анализа причины её можно вернуть в Queue.";
                 await _taskStore.FailTaskAsync(task.Id, report, CancellationToken.None).ConfigureAwait(false);
                 Console.Error.WriteLine($"[Executor] Задача '{task.Id}' завершилась ошибкой: {exception.Message}");
+                if (_journal is not null) await _journal.WriteAsync("task_error", "Ошибка выполнения задачи", exception.Message, task.Id, "error", CancellationToken.None).ConfigureAwait(false);
             }
             processed++;
         }

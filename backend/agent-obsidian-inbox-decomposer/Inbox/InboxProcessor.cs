@@ -1,4 +1,5 @@
 using TaskSandbox.Obsidian;
+using TaskSandbox.Execution;
 using TaskSandbox.Planning;
 
 namespace TaskSandbox.Inbox;
@@ -23,15 +24,18 @@ public sealed class InboxProcessor
     private readonly ObsidianTaskStore _taskStore;
     private readonly TaskDecomposer _decomposer;
     private readonly InboxProcessorOptions _options;
+    private readonly RuntimeEventJournal? _journal;
 
     public InboxProcessor(
         ObsidianTaskStore taskStore,
         TaskDecomposer decomposer,
-        InboxProcessorOptions options)
+        InboxProcessorOptions options,
+        RuntimeEventJournal? journal = null)
     {
         _taskStore = taskStore ?? throw new ArgumentNullException(nameof(taskStore));
         _decomposer = decomposer ?? throw new ArgumentNullException(nameof(decomposer));
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _journal = journal;
 
         if (string.IsNullOrWhiteSpace(options.WorkspaceId))
             throw new ArgumentException("WorkspaceId must be configured.", nameof(options));
@@ -76,6 +80,7 @@ public sealed class InboxProcessor
                 cancellationToken).ConfigureAwait(false);
 
             Console.WriteLine($"[Inbox] Принята большая задача '{planningTask.Id}': {planningTask.Title}");
+            if (_journal is not null) await _journal.WriteAsync("inbox_accepted", "Получена новая задача", planningTask.Title, planningTask.Id, cancellationToken: CancellationToken.None).ConfigureAwait(false);
             return await PlanOneAsync(planningTask, cancellationToken).ConfigureAwait(false);
         }
 
@@ -110,6 +115,7 @@ public sealed class InboxProcessor
 
             Console.WriteLine(
                 $"[Decomposer] План '{result.ParentTaskId}' опубликован: {result.Title}; подзадач: {result.SubtaskCount}.");
+            if (_journal is not null) await _journal.WriteAsync("planning_completed", "Планирование завершено", $"Опубликовано подзадач: {result.SubtaskCount}", task.Id, cancellationToken: CancellationToken.None).ConfigureAwait(false);
             return InboxProcessStatus.PublishedPlan;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -119,6 +125,7 @@ public sealed class InboxProcessor
         catch (Exception exception) when (IsRecoverablePlanningError(exception))
         {
             Console.Error.WriteLine($"[Decomposer] Не удалось обработать '{task.Id}': {exception.Message}");
+            if (_journal is not null) await _journal.WriteAsync("planning_failed", "Ошибка планирования", exception.Message, task.Id, "error", CancellationToken.None).ConfigureAwait(false);
             await _taskStore.SetPlanningErrorAsync(
                 task.Id,
                 exception.Message,

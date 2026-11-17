@@ -5,6 +5,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.FileProviders;
 using TaskSandbox.Configuration;
 using TaskSandbox.Obsidian;
+using TaskSandbox.Execution;
 
 namespace TaskSandbox.Web;
 
@@ -12,10 +13,12 @@ namespace TaskSandbox.Web;
 public static class WebDashboardHost
 {
     private static readonly string[] TaskFolders = ["Inbox", "Planning", "Queue", "InProgress", "Completed", "Failed"];
+    private static readonly SemaphoreSlim TaskFileLock = new(1, 1);
 
     private sealed record DashboardTask(string Id, string Title, string Description, string Status, string Priority, string WorkspaceId, string ParentId, DateTime UpdatedUtc);
+    public sealed record UpdateTaskRequest(string? Title, string? Description, string? Priority);
 
-    public static async Task RunAsync(AgentSettings settings, CancellationToken cancellationToken)
+    public static async Task RunAsync(AgentSettings settings, RuntimeEventJournal journal, CancellationToken cancellationToken)
     {
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.WebHost.UseUrls("http://127.0.0.1:5080");
@@ -35,50 +38,93 @@ public static class WebDashboardHost
 
         string agentRoot = Path.Combine(Path.GetFullPath(settings.Obsidian.VaultPath), "LocalCodingAgent");
         app.MapGet("/api/health", () => Results.Ok(new { status = "online", product = "TS — Task Sandbox" }));
-        app.MapGet("/api/dashboard", () => Results.Ok(BuildDashboard(settings, agentRoot)));
+        app.MapGet("/api/dashboard", () => Results.Ok(BuildDashboard(settings, agentRoot, journal)));
         app.MapGet("/api/tasks", () => Results.Ok(ReadTasks(agentRoot)));
-        app.MapGet("/api/settings", () => Results.Ok(new
+        app.MapGet("/api/activity", (int? limit) => Results.Ok(journal.ReadRecent(limit ?? 100)));
+        app.MapPut("/api/tasks/{id}", async (string id, UpdateTaskRequest request, CancellationToken token) =>
         {
-            productName = "TS — Task Sandbox",
-            activeProfileId = settings.Model.ActiveProfileId,
-            profiles = settings.Model.Profiles.Select(profile => new
+            if (string.IsNullOrWhiteSpace(id) || id.Length > 160 ||
+                (request.Title?.Length ?? 0) > 240 || (request.Description?.Length ?? 0) > 100_000 ||
+                (request.Priority is not null && request.Priority is not ("low" or "normal" or "high" or "urgent")))
+                return Results.BadRequest(new { error = "Некорректные данные задачи." });
+
+            string? file = FindTaskFile(agentRoot, id);
+            if (file is null) return Results.NotFound(new { error = "Задача не найдена." });
+
+            await TaskFileLock.WaitAsync(token).ConfigureAwait(false);
+            try
             {
-                profile.Id, profile.Name, profile.ProviderId, profile.BaseUrl, profile.ModelId,
-                profile.RequestTimeoutSeconds
-            }),
-            workspaces = settings.Workspaces.Registered.Select(workspace => new
+                string markdown = await File.ReadAllTextAsync(file, token).ConfigureAwait(false);
+                MarkdownFrontmatter frontmatter = MarkdownFrontmatter.Parse(markdown);
+                if (request.Title is not null) frontmatter.SetValue("title", request.Title.Trim());
+                if (request.Priority is not null) frontmatter.SetValue("priority", request.Priority);
+                if (request.Description is not null) frontmatter.Body = request.Description.Trim();
+                string temporary = file + ".ts-tmp";
+                await File.WriteAllTextAsync(temporary, frontmatter.ToMarkdown(), token).ConfigureAwait(false);
+                File.Move(temporary, file, overwrite: true);
+                return Results.Ok(new { saved = true });
+            }
+            catch (InvalidDataException exception)
             {
-                workspace.Id, workspace.Path, isDefault = workspace.Id == settings.Workspaces.DefaultId
-            }),
-            obsidian = new { settings.Obsidian.VaultPath }
-        }));
+                return Results.BadRequest(new { error = exception.Message });
+            }
+            finally
+            {
+                TaskFileLock.Release();
+            }
+        });
+        app.MapGet("/api/settings", () =>
+        {
+            IReadOnlyList<DashboardTask> tasks = ReadTasks(agentRoot);
+            return Results.Ok(new
+            {
+                productName = "TS — Task Sandbox",
+                activeProfileId = settings.Model.ActiveProfileId,
+                profiles = settings.Model.Profiles.Select(profile => new
+                {
+                    profile.Id, profile.Name, profile.ProviderId, profile.BaseUrl, profile.ModelId,
+                    profile.RequestTimeoutSeconds
+                }),
+                workspaces = settings.Workspaces.Registered.Select(workspace => new
+                {
+                    workspace.Id, workspace.Path, isDefault = workspace.Id == settings.Workspaces.DefaultId,
+                    exists = Directory.Exists(workspace.Path),
+                    taskCount = tasks.Count(task => string.Equals(task.WorkspaceId, workspace.Id, StringComparison.OrdinalIgnoreCase))
+                }),
+                obsidian = new { settings.Obsidian.VaultPath }
+            });
+        });
 
         Console.WriteLine("[Web] TS — Task Sandbox: http://127.0.0.1:5080");
         await app.RunAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static object BuildDashboard(AgentSettings settings, string root)
+    private static object BuildDashboard(AgentSettings settings, string root, RuntimeEventJournal journal)
     {
         int Count(string folder) => CountMarkdown(Path.Combine(root, folder));
         DashboardTask? currentTask = ReadTasks(root).FirstOrDefault(task => task.Status.Equals("InProgress", StringComparison.OrdinalIgnoreCase));
         int completedToday = CountMarkdown(Path.Combine(root, "Completed"), DateTime.UtcNow.Date);
         ModelProfileSettings? active = settings.Model.Profiles.FirstOrDefault(profile =>
             profile.Id.Equals(settings.Model.ActiveProfileId, StringComparison.OrdinalIgnoreCase));
+        (int eventsToday, int errors, int fixes) = journal.GetTodaySummary();
+        RuntimeEvent? currentActivity = currentTask is null
+            ? null
+            : journal.ReadRecent(200).FirstOrDefault(item => item.TaskId == currentTask.Id);
 
         return new
         {
             agent = new { status = "running" },
             currentTask,
+            currentActivity,
             today = new { completed = completedToday },
             totals = new
             {
                 inbox = Count("Inbox"), planning = Count("Planning"), queued = Count("Queue"),
                 inProgress = Count("InProgress"), completed = Count("Completed"), failed = Count("Failed")
             },
-            // These metrics require runtime event instrumentation; never fabricate them from file counts.
-            activityPercent = (int?)null,
-            errorsToday = (int?)null,
-            fixesToday = (int?)null,
+            eventsToday,
+            errorsToday = errors,
+            fixesToday = fixes,
             model = active is null ? null : new { providerId = active.ProviderId, providerName = ProviderCatalogName(active.ProviderId), active.ModelId }
         };
     }
@@ -118,6 +164,29 @@ public static class WebDashboardHost
                     pending.Push(child);
             }
         }
+    }
+
+
+    private static string? FindTaskFile(string root, string id)
+    {
+        foreach (string folder in TaskFolders)
+        {
+            string directory = Path.Combine(root, folder);
+            if (!Directory.Exists(directory)) continue;
+            foreach (string file in EnumerateMarkdownSafe(directory))
+            {
+                var info = new FileInfo(file);
+                if (info.Length > 1_048_576) continue;
+                try
+                {
+                    MarkdownFrontmatter frontmatter = MarkdownFrontmatter.Parse(File.ReadAllText(file));
+                    string taskId = frontmatter.GetValue("id", Path.GetFileNameWithoutExtension(file));
+                    if (string.Equals(taskId, id, StringComparison.Ordinal)) return file;
+                }
+                catch (InvalidDataException) { }
+            }
+        }
+        return null;
     }
 
     private static IReadOnlyList<DashboardTask> ReadTasks(string root)

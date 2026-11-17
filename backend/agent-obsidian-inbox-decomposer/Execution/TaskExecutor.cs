@@ -23,6 +23,7 @@ public sealed class TaskExecutor
     private readonly string _workspacePath;
     private readonly string _workspaceId;
     private readonly ExecutionService _executionService;
+    private readonly RuntimeEventJournal? _journal;
 
     public TaskExecutor(
         IModelProvider modelProvider,
@@ -30,13 +31,15 @@ public sealed class TaskExecutor
         string workspaceId,
         string workspacePath,
         TimeSpan? processTimeout = null,
-        int maxProcessOutputCharacters = 65536)
+        int maxProcessOutputCharacters = 65536,
+        RuntimeEventJournal? journal = null)
     {
         _modelProvider = modelProvider ?? throw new ArgumentNullException(nameof(modelProvider));
         _contextBuilder = contextBuilder ?? throw new ArgumentNullException(nameof(contextBuilder));
         ArgumentException.ThrowIfNullOrWhiteSpace(workspaceId);
         ArgumentException.ThrowIfNullOrWhiteSpace(workspacePath);
         _workspaceId = workspaceId;
+        _journal = journal;
         _workspacePath = Path.GetFullPath(workspacePath);
         _executionService = new ExecutionService(_workspacePath,
             processTimeout ?? TimeSpan.FromMinutes(10), maxProcessOutputCharacters);
@@ -114,8 +117,12 @@ public sealed class TaskExecutor
                 arguments.ValueKind != JsonValueKind.Object)
                 throw new InvalidDataException("Поле arguments должно быть JSON-объектом.");
 
+            if (_journal is not null)
+                await _journal.WriteAsync("tool_started", $"Инструмент: {toolName}", "Вызов инструмента запущен", task.Id, cancellationToken: CancellationToken.None).ConfigureAwait(false);
             ToolExecutionResult result = await tools.ExecuteAsync(toolName, arguments, cancellationToken)
                 .ConfigureAwait(false);
+            if (_journal is not null)
+                await _journal.WriteAsync(result.Success ? "tool_succeeded" : "tool_failed", $"Инструмент: {toolName}", result.Success ? "Операция выполнена" : "Инструмент вернул ошибку", task.Id, result.Success ? "info" : "error", CancellationToken.None).ConfigureAwait(false);
             string toolResult = JsonSerializer.Serialize(new
             {
                 tool = toolName,

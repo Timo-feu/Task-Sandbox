@@ -149,6 +149,8 @@ public static class Program
             });
             taskStore.EnsureInitialized();
 
+            var journal = new RuntimeEventJournal(Path.Combine(vaultPath, "LocalCodingAgent", "Logs"));
+            await journal.WriteAsync("agent_started", "Агент запущен", $"Workspace: {workspaceId}", cancellationToken: CancellationToken.None).ConfigureAwait(false);
             var taskContextBuilder = new TaskContextBuilder(taskStore, prompts);
             var decomposer = new TaskDecomposer(modelProvider, taskStore, taskContextBuilder);
             var inboxProcessor = new InboxProcessor(
@@ -159,7 +161,7 @@ public static class Program
                     WorkspaceId = workspaceId,
                     WorkspacePath = workspacePath,
                     PollInterval = TimeSpan.FromSeconds(settings.Runtime.InboxPollIntervalSeconds)
-                });
+                }, journal);
 
             if (settings.Runtime.MaxConcurrentTasks > 1)
                 Console.WriteLine("[Runtime] Queue Worker пока работает последовательно; runtime.maxConcurrentTasks временно не применяется.");
@@ -167,21 +169,21 @@ public static class Program
             var executor = new TaskExecutor(
                 modelProvider, taskContextBuilder, workspaceId, workspacePath,
                 TimeSpan.FromSeconds(settings.Runtime.ProcessTimeoutSeconds),
-                settings.Runtime.MaxProcessOutputCharacters);
+                settings.Runtime.MaxProcessOutputCharacters, journal);
             var validator = new ResultValidator(workspacePath);
             var recoveryStore = new WorkspaceRecoveryStore(workspacePath);
             int recoveredFiles = recoveryStore.RecoverInterruptedSessions();
             if (recoveredFiles > 0)
                 Console.WriteLine($"[Recovery] Восстановлено прерванных файловых транзакций: {recoveredFiles}.");
             var executionPipeline = new SelfCorrectionEngine(
-                executor, validator, settings.Runtime.MaxCorrectionAttempts, recoveryStore);
+                executor, validator, settings.Runtime.MaxCorrectionAttempts, recoveryStore, journal);
             ProjectMemoryUpdater? memoryUpdater = (prompts.Features & PromptFeatures.Memory) != 0
                 ? new ProjectMemoryUpdater(modelProvider, taskStore, prompts.ProjectMemoryUpdatePrompt)
                 : null;
             var queueWorker = new QueueWorker(taskStore, executionPipeline, new QueueWorkerOptions
             {
                 PollInterval = TimeSpan.FromSeconds(settings.Runtime.InboxPollIntervalSeconds)
-            }, memoryUpdater);
+            }, memoryUpdater, journal);
             var runtime = new AgentRuntime(
                 taskStore,
                 inboxProcessor,
@@ -195,7 +197,7 @@ public static class Program
             }
 
             Task runtimeTask = runtime.RunAsync(cancellationToken);
-            Task webTask = WebDashboardHost.RunAsync(settings, cancellationToken);
+            Task webTask = WebDashboardHost.RunAsync(settings, journal, cancellationToken);
             await Task.WhenAll(runtimeTask, webTask).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

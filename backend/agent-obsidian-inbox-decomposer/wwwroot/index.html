@@ -36,8 +36,17 @@
                 <button class="nav-item" data-page="tasks" type="button">
                     <span class="nav-icon">☷</span><span>Задачи</span><span class="nav-count" id="nav-task-count">0</span>
                 </button>
-                <button class="nav-item" data-page="activity" type="button">
+                <button class="nav-item" data-page="queue" data-title="Очередь" type="button">
+                    <span class="nav-icon">⇄</span><span>Очередь</span><span class="nav-count" id="nav-queue-count">0</span>
+                </button>
+                <button class="nav-item" data-page="activity" data-title="Активность" type="button">
                     <span class="nav-icon">◷</span><span>Активность</span>
+                </button>
+                <button class="nav-item" data-page="workspaces" data-title="Рабочие пространства" type="button">
+                    <span class="nav-icon">▣</span><span>Рабочие пространства</span>
+                </button>
+                <button class="nav-item" data-page="logs" data-title="Журнал" type="button">
+                    <span class="nav-icon">≡</span><span>Журнал</span>
                 </button>
 
                 <span class="nav-caption nav-caption-spaced">СИСТЕМА</span>
@@ -58,7 +67,7 @@
         <main class="main-content">
             <header class="topbar">
                 <div>
-                    <div class="eyebrow">TASK SANDBOX / OVERVIEW / V1</div>
+                    <div class="eyebrow">TASK SANDBOX / OVERVIEW</div>
                     <h1 id="page-title">Дашборд</h1>
                     <p class="page-subtitle">Состояние автономного агента в реальном времени</p>
                 </div>
@@ -76,14 +85,14 @@
                         <div class="metric-foot">Задачи в Completed за сегодня</div>
                     </article>
                     <article class="metric-card">
-                        <div class="metric-heading"><span>Активность</span><span class="metric-icon cyan">⌁</span></div>
+                        <div class="metric-heading"><span>События сегодня</span><span class="metric-icon cyan">⌁</span></div>
                         <div class="metric-value" id="activity">—</div>
-                        <div class="metric-foot">Будет рассчитана по событиям агента</div>
+                        <div class="metric-foot">Зафиксированные события runtime</div>
                     </article>
                     <article class="metric-card">
                         <div class="metric-heading"><span>Ошибки сегодня</span><span class="metric-icon amber">!</span></div>
                         <div class="metric-value danger-text" id="errors">—</div>
-                        <div class="metric-foot">Ошибки выполнения и проверки</div>
+                        <div class="metric-foot">Ошибки планирования и выполнения</div>
                     </article>
                     <article class="metric-card">
                         <div class="metric-heading"><span>Исправления сегодня</span><span class="metric-icon green">↗</span></div>
@@ -123,19 +132,53 @@
 
                 <article class="panel recent-panel">
                     <div class="panel-heading"><div><span class="eyebrow">WORK QUEUE</span><h2>Последние задачи</h2></div><button class="text-button" data-open-page="tasks" type="button">Все задачи →</button></div>
-                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th></tr></thead><tbody id="recent-tasks-body"></tbody></table></div>
+                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th><th></th></tr></thead><tbody id="recent-tasks-body"></tbody></table></div>
+                </article>
+                <article class="panel recent-panel">
+                    <div class="panel-heading"><div><span class="eyebrow">RUNTIME JOURNAL</span><h2>Последняя активность</h2></div><button class="text-button" data-open-page="activity" type="button">Вся история →</button></div>
+                    <div id="dashboard-activity" class="activity-list"><div class="activity-empty">Событий пока нет</div></div>
                 </article>
             </section>
 
             <section id="page-tasks" class="page-section hidden">
                 <article class="panel">
                     <div class="panel-heading"><div><span class="eyebrow">TASK MANAGEMENT</span><h2>Задачи</h2></div><span class="muted-text" id="task-count">0 задач</span></div>
-                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th></tr></thead><tbody id="tasks-body"></tbody></table></div>
+                    <div class="task-toolbar"><input id="task-search" class="field" type="search" placeholder="Поиск по названию, ID или Workspace…" aria-label="Поиск задач"><select id="task-status-filter" class="field" aria-label="Фильтр по статусу"><option value="">Все статусы</option><option>Inbox</option><option>Planning</option><option>Queue</option><option>InProgress</option><option>Completed</option><option>Failed</option></select></div>
+                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th><th></th></tr></thead><tbody id="tasks-body"></tbody></table></div>
+                </article>
+            </section>
+
+            <section id="page-queue" class="page-section hidden">
+                <div class="metric-grid queue-metrics">
+                    <article class="metric-card"><div class="metric-heading"><span>Ожидают</span><span class="metric-icon cyan">◷</span></div><div class="metric-value" id="queue-waiting">0</div><div class="metric-foot">Задачи в Queue</div></article>
+                    <article class="metric-card"><div class="metric-heading"><span>Выполняются</span><span class="metric-icon purple">↻</span></div><div class="metric-value" id="queue-running">0</div><div class="metric-foot">Задачи в InProgress</div></article>
+                    <article class="metric-card"><div class="metric-heading"><span>Неудачные</span><span class="metric-icon amber">!</span></div><div class="metric-value danger-text" id="queue-failed">0</div><div class="metric-foot">Требуют анализа</div></article>
+                </div>
+                <article class="panel">
+                    <div class="panel-heading"><div><span class="eyebrow">TASK PIPELINE</span><h2>Очередь выполнения</h2></div><span class="muted-text" id="queue-count">0 задач</span></div>
+                    <div class="task-toolbar"><input id="queue-search" class="field" type="search" placeholder="Поиск в очереди…" aria-label="Поиск в очереди"><select id="queue-status-filter" class="field" aria-label="Фильтр очереди"><option value="">Все этапы</option><option value="Queue">Ожидает</option><option value="InProgress">Выполняется</option><option value="Failed">Ошибка</option></select></div>
+                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th></tr></thead><tbody id="queue-body"></tbody></table></div>
                 </article>
             </section>
 
             <section id="page-activity" class="page-section hidden">
-                <article class="panel empty-state"><div class="empty-state-icon">◷</div><h2>История активности</h2><p>Здесь появятся события планирования, выполнения инструментов, ошибок и исправлений после подключения журнала runtime.</p></article>
+                <article class="panel">
+                    <div class="panel-heading"><div><span class="eyebrow">RUNTIME JOURNAL</span><h2>История активности</h2></div><span class="muted-text" id="activity-count">0 событий</span></div>
+                    <div id="activity-list" class="activity-list"><div class="activity-empty">Загрузка событий…</div></div>
+                </article>
+            </section>
+
+            <section id="page-workspaces" class="page-section hidden">
+                <div class="page-intro"><span class="eyebrow">PROJECT ENVIRONMENTS</span><h2>Рабочие пространства</h2><p>Зарегистрированные каталоги проектов и распределение задач.</p></div>
+                <div class="workspace-grid" id="workspace-cards"></div>
+            </section>
+
+            <section id="page-logs" class="page-section hidden">
+                <article class="panel">
+                    <div class="panel-heading"><div><span class="eyebrow">RUNTIME LOG</span><h2>Журнал событий</h2></div><span class="muted-text" id="logs-count">0 записей</span></div>
+                    <div class="task-toolbar"><input id="logs-search" class="field" type="search" placeholder="Поиск по событиям, описанию или ID…" aria-label="Поиск по журналу"><select id="logs-severity" class="field" aria-label="Фильтр по важности"><option value="">Все уровни</option><option value="info">Информация</option><option value="warning">Предупреждения</option><option value="error">Ошибки</option></select></div>
+                    <div id="logs-list" class="activity-list"><div class="activity-empty">Загрузка журнала…</div></div>
+                </article>
             </section>
 
             <section id="page-models" class="page-section hidden">
