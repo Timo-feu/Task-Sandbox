@@ -79,7 +79,16 @@ public sealed class ObsidianTaskStore
             cancellationToken.ThrowIfCancellationRequested();
             EnsureNoReparsePoints(filePath);
             string markdown = await ReadMarkdownAsync(filePath, cancellationToken).ConfigureAwait(false);
-            result.Add(ParseTask(markdown, filePath, fallbackId: Path.GetFileNameWithoutExtension(filePath)));
+            ObsidianTaskDocument task = ParseTask(
+                markdown, filePath, fallbackId: Path.GetFileNameWithoutExtension(filePath));
+
+            // Inbox is a draft area. Only an explicit status: ready publishes a note
+            // to the agent; missing status is deliberately treated as a draft.
+            if (!string.Equals(task.Status, "ready", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(task.Body))
+                continue;
+
+            result.Add(task);
         }
 
         return result;
@@ -238,6 +247,12 @@ public sealed class ObsidianTaskStore
         EnsureNoReparsePoints(sourcePath);
         string markdown = await ReadMarkdownAsync(sourcePath, cancellationToken).ConfigureAwait(false);
         MarkdownFrontmatter frontmatter = MarkdownFrontmatter.Parse(markdown);
+        ObsidianTaskDocument inboxTask = ParseTask(
+            markdown, sourcePath, Path.GetFileNameWithoutExtension(sourcePath));
+        if (!string.Equals(inboxTask.Status, "ready", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Задача ещё не опубликована. Установи status: ready в Frontmatter.");
+        if (string.IsNullOrWhiteSpace(inboxTask.Body))
+            throw new InvalidDataException("Пустую заметку нельзя отправить на планирование.");
 
         string id = frontmatter.GetValue("id");
         if (string.IsNullOrWhiteSpace(id))
@@ -246,8 +261,8 @@ public sealed class ObsidianTaskStore
 
         string destinationDirectory = Path.Combine(GetManagedDirectory(PlanningFolder), id);
         string destinationPath = Path.Combine(destinationDirectory, "Original.md");
-        if (Directory.Exists(destinationDirectory) || File.Exists(destinationPath))
-            throw new IOException($"Задача '{id}' уже существует в Planning.");
+        if (TaskIdExists(id))
+            throw new IOException($"Задача '{id}' уже существует в Planning, Queue, InProgress, Completed или Failed.");
 
         Directory.CreateDirectory(destinationDirectory);
         EnsureNoReparsePoints(destinationDirectory);
@@ -258,6 +273,9 @@ public sealed class ObsidianTaskStore
             string movedMarkdown = await ReadMarkdownAsync(destinationPath, cancellationToken).ConfigureAwait(false);
             frontmatter = MarkdownFrontmatter.Parse(movedMarkdown);
             frontmatter.SetValue("id", id);
+            frontmatter.SetValue("title", inboxTask.Title);
+            if (string.IsNullOrWhiteSpace(frontmatter.GetValue("priority")))
+                frontmatter.SetValue("priority", "normal");
             frontmatter.SetValue("type", "request");
             frontmatter.SetValue("status", "planning");
             await WriteMarkdownAtomicAsync(destinationPath, frontmatter.ToMarkdown(), cancellationToken)
@@ -804,6 +822,23 @@ public sealed class ObsidianTaskStore
 
         if (visited != plan.Subtasks.Count)
             throw new InvalidDataException("В плане обнаружена циклическая зависимость между подзадачами.");
+    }
+
+    private bool TaskIdExists(string taskId)
+    {
+        foreach (string folder in new[]
+        {
+            PlanningFolder, QueueFolder, InProgressFolder, CompletedFolder, FailedFolder
+        })
+        {
+            string path = Path.Combine(GetManagedDirectory(folder), taskId);
+            if (Directory.Exists(path) || File.Exists(path) ||
+                (folder != PlanningFolder && Directory.EnumerateFiles(
+                    GetManagedDirectory(folder), taskId + ".md", SearchOption.TopDirectoryOnly).Any()))
+                return true;
+        }
+
+        return false;
     }
 
     private string GetManagedDirectory(string folderName) => Path.Combine(_agentRoot, folderName);

@@ -148,8 +148,12 @@ LocalCodingAgent/
 └── Reports/
 ```
 
-- Пользователь создаёт большие задачи в `Inbox`.
-- `InboxProcessor` переносит заметку в `Planning`.
+- Пользователь создаёт большие задачи в `Inbox` из `Templates/InboxTaskTemplate.md`.
+- Новая заметка создаётся со `status: draft`; агент не читает её как готовую задачу и не перемещает.
+- После завершения редактирования пользователь явно меняет Frontmatter на `status: ready`.
+- Только непустые заметки со `status: ready` принимаются в `Planning`; заметки без статуса считаются черновиками.
+- При импорте отсутствующие `title` и `priority` нормализуются (заголовок берётся из первого Markdown-заголовка, приоритет — `normal`).
+- ID проверяется на наличие в Planning, Queue, InProgress, Completed и Failed, чтобы не создать вторую родительскую задачу с тем же ID.
 - `TaskDecomposer` отправляет отдельный запрос модели и проверяет JSON-план.
 - `ObsidianTaskStore` публикует все подзадачи в Queue атомарным перемещением staging-директории.
 - `ProjectMemory.md` остаётся компактной смысловой памятью проекта. Обязательного сканера и автоматической инвентаризации файлов нет.
@@ -171,7 +175,7 @@ dotnet build .\backend.csproj -c Release
 dotnet run --project .\backend.csproj -- --once
 ```
 
-Постоянный опрос Inbox:
+Постоянный опрос Inbox и Queue (проверяются только заметки со `status: ready`):
 
 ```powershell
 dotnet run --project .\backend.csproj

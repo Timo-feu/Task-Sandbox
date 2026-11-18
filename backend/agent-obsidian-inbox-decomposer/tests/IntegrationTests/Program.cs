@@ -16,6 +16,7 @@ internal static class Program
         Directory.CreateDirectory(root);
         try
         {
+            await TestInboxDraftGateAsync(root);
             await TestFullPipelineAsync(root);
             TestRecovery(root);
             await TestGitAsync(root);
@@ -35,6 +36,48 @@ internal static class Program
         }
     }
 
+    private static async Task TestInboxDraftGateAsync(string root)
+    {
+        string vault = Path.Combine(root, "inbox-gate-vault");
+        var store = new ObsidianTaskStore(new ObsidianTaskStoreOptions { VaultPath = vault });
+        store.EnsureInitialized();
+        string inbox = Path.Combine(store.AgentRootPath, "Inbox");
+
+        await File.WriteAllTextAsync(Path.Combine(inbox, "draft.md"),
+            "---\nid: draft-001\nstatus: draft\n---\n# Черновик\nТекст в процессе редактирования.");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "legacy.md"),
+            "---\nid: legacy-001\n---\n# Старая заметка без статуса\nНе должна забираться автоматически.");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "empty-ready.md"),
+            "---\nid: empty-001\nstatus: ready\n---\n");
+        await File.WriteAllTextAsync(Path.Combine(inbox, "ready.md"),
+            "---\nid: ready-001\nstatus: ready\n---\n# Опубликованная задача\nСодержимое задачи.");
+
+        IReadOnlyList<ObsidianTaskDocument> ready = await store.ReadInboxAsync();
+        Assert(ready.Count == 1, "Inbox должен возвращать только непустые заметки со status: ready.");
+        Assert(ready[0].Id == "ready-001", "В обработку должна попасть только опубликованная заметка.");
+        Assert(ready[0].Title == "Опубликованная задача", "Заголовок должен извлекаться из первого Markdown heading.");
+
+        string firstDuplicate = Path.Combine(inbox, "duplicate-a.md");
+        string secondDuplicate = Path.Combine(inbox, "duplicate-b.md");
+        const string duplicateNote = "---\nid: duplicate-001\nstatus: ready\n---\n# Дубликат\nТекст задачи.";
+        await File.WriteAllTextAsync(firstDuplicate, duplicateNote);
+        await File.WriteAllTextAsync(secondDuplicate, duplicateNote);
+        await store.MoveInboxTaskToPlanningAsync(firstDuplicate);
+        bool duplicateRejected = false;
+        try
+        {
+            await store.MoveInboxTaskToPlanningAsync(secondDuplicate);
+        }
+        catch (IOException)
+        {
+            duplicateRejected = true;
+        }
+        Assert(duplicateRejected, "Повторный родительский ID должен блокироваться.");
+        Assert(File.Exists(secondDuplicate), "Дубликат не должен исчезать из Inbox незаметно.");
+
+        Console.WriteLine("PASS: Inbox draft gate и защита от повторного родительского ID.");
+    }
+
     private static async Task TestFullPipelineAsync(string root)
     {
         string vault = Path.Combine(root, "vault");
@@ -45,7 +88,7 @@ internal static class Program
         store.EnsureInitialized();
         string inboxPath = Path.Combine(store.AgentRootPath, "Inbox", "parent-001.md");
         await File.WriteAllTextAsync(inboxPath,
-            "---\nid: parent-001\nworkspace: demo\npriority: normal\ndependency_policy: existing_only\nstatus: pending\n---\n" +
+            "---\nid: parent-001\nworkspace: demo\npriority: normal\ndependency_policy: existing_only\nstatus: ready\n---\n" +
             "# Integration smoke task\n\nCreate a harmless documentation-only task.\n");
 
         var provider = new ScriptedModelProvider();

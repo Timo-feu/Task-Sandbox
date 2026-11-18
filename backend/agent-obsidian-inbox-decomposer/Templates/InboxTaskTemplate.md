@@ -1,9 +1,11 @@
 ---
+title: ""
 priority: normal
+status: draft
 dependency_policy: existing_only
 ---
 
-# Название большой задачи
+# Название задачи
 
 ## Цель
 
@@ -29,3 +31,7 @@ dependency_policy: existing_only
 
 - Как проверить, что задача выполнена.
 
+---
+
+Когда закончишь редактирование, поменяй `status: draft` на `status: ready`.
+Только после этого Task Sandbox заберёт заметку из Inbox и начнёт планирование.
