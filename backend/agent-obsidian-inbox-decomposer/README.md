@@ -280,3 +280,28 @@ dotnet run --project .\Desktop\TaskSandbox.Desktop.csproj
 The desktop build copies the backend output into its `Agent` subdirectory. Microsoft Edge WebView2 Runtime must be installed on Windows. The backend remains independently runnable with `dotnet run --project .\backend.csproj` for development and diagnostics.
 
 Dashboard assets are intentionally split into `wwwroot\index.html`, `wwwroot\css\styles.css`, and `wwwroot\js\app.js`.
+
+
+## Stage 4 — Live Runtime Reliability
+
+This build keeps the Inbox → Planning → Queue → Execution pipeline running after
+recoverable runtime-cycle failures.
+
+- `AgentRuntime` now catches unexpected cycle errors, writes a `runtime_cycle_error`
+  activity event, waits for the configured polling interval, reinitializes the task
+  store/recovery state, and resumes polling instead of silently leaving the dashboard
+  online with a dead worker.
+- A successful runtime initialization writes a `runtime_ready` activity event.
+- The Desktop host captures backend stdout/stderr in
+  `%LOCALAPPDATA%\\TS\\TaskSandbox\\Logs\\backend.log`.
+  If the backend exits during startup, the error dialog includes the log path.
+- The Activity page labels the new runtime events.
+
+The runtime starts automatically with the backend. Put a parent request in the
+Obsidian `LocalCodingAgent/Inbox` folder; the Decomposer publishes subtasks into
+`Queue`, and the Queue Worker claims ready subtasks automatically. A queued task
+with unfinished `depends_on` entries remains waiting until those dependencies are
+in `Completed`.
+
+Build verification: JavaScript syntax was checked with `node --check`. A .NET build
+was not run in this environment because the .NET SDK is unavailable.

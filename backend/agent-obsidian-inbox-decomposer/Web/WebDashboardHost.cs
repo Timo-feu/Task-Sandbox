@@ -37,10 +37,52 @@ public static class WebDashboardHost
         }
 
         string agentRoot = Path.Combine(Path.GetFullPath(settings.Obsidian.VaultPath), "LocalCodingAgent");
-        app.MapGet("/api/health", () => Results.Ok(new { status = "online", product = "TS — Task Sandbox" }));
+        app.MapGet("/api/health", () => Results.Ok(new
+        {
+            status = "online",
+            product = "TS — Task Sandbox",
+            serverTimeUtc = DateTime.UtcNow,
+            processId = Environment.ProcessId
+        }));
         app.MapGet("/api/dashboard", () => Results.Ok(BuildDashboard(settings, agentRoot, journal)));
         app.MapGet("/api/tasks", () => Results.Ok(ReadTasks(agentRoot)));
         app.MapGet("/api/activity", (int? limit) => Results.Ok(journal.ReadRecent(limit ?? 100)));
+        var taskStore = new ObsidianTaskStore(new ObsidianTaskStoreOptions
+        {
+            VaultPath = settings.Obsidian.VaultPath
+        });
+        app.MapPost("/api/tasks/{id}/retry", async (string id, CancellationToken token) =>
+        {
+            if (string.IsNullOrWhiteSpace(id) || id.Length > 80)
+                return Results.BadRequest(new { error = "Некорректный ID задачи." });
+
+            await TaskFileLock.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                await taskStore.RequeueFailedTaskAsync(id, token).ConfigureAwait(false);
+                return Results.Ok(new { queued = true, id });
+            }
+            catch (FileNotFoundException)
+            {
+                return Results.NotFound(new { error = "Неудачная задача не найдена. Возможно, она уже была возвращена в очередь." });
+            }
+            catch (InvalidDataException exception)
+            {
+                return Results.BadRequest(new { error = exception.Message });
+            }
+            catch (ArgumentException exception)
+            {
+                return Results.BadRequest(new { error = exception.Message });
+            }
+            catch (IOException exception)
+            {
+                return Results.Conflict(new { error = exception.Message });
+            }
+            finally
+            {
+                TaskFileLock.Release();
+            }
+        });
         app.MapPut("/api/tasks/{id}", async (string id, UpdateTaskRequest request, CancellationToken token) =>
         {
             if (string.IsNullOrWhiteSpace(id) || id.Length > 160 ||

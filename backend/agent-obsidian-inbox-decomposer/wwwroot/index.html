@@ -16,7 +16,7 @@
                     <strong>TS</strong>
                     <span>Task Sandbox</span>
                 </div>
-                <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Свернуть меню">‹</button>
+                <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Свернуть меню" aria-expanded="true" title="Свернуть меню">‹</button>
             </div>
 
             <div class="workspace-switcher">
@@ -157,7 +157,7 @@
                 <article class="panel">
                     <div class="panel-heading"><div><span class="eyebrow">TASK PIPELINE</span><h2>Очередь выполнения</h2></div><span class="muted-text" id="queue-count">0 задач</span></div>
                     <div class="task-toolbar"><input id="queue-search" class="field" type="search" placeholder="Поиск в очереди…" aria-label="Поиск в очереди"><select id="queue-status-filter" class="field" aria-label="Фильтр очереди"><option value="">Все этапы</option><option value="Queue">Ожидает</option><option value="InProgress">Выполняется</option><option value="Failed">Ошибка</option></select></div>
-                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th></tr></thead><tbody id="queue-body"></tbody></table></div>
+                    <div class="table-scroll"><table><thead><tr><th>Задача</th><th>Статус</th><th>Приоритет</th><th>Workspace</th><th>Обновлена</th><th></th></tr></thead><tbody id="queue-body"></tbody></table></div>
                 </article>
             </section>
 

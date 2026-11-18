@@ -188,7 +188,8 @@ public static class Program
                 taskStore,
                 inboxProcessor,
                 queueWorker,
-                TimeSpan.FromSeconds(settings.Runtime.InboxPollIntervalSeconds));
+                TimeSpan.FromSeconds(settings.Runtime.InboxPollIntervalSeconds),
+                journal);
 
             if (args.Contains("--once", StringComparer.OrdinalIgnoreCase))
             {

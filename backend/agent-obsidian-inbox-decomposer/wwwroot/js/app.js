@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const pageIds = ["dashboard", "tasks", "queue", "activity", "workspaces", "logs", "models", "settings"];
-const state = { tasks: [], settings: null, dashboard: null, activity: [], filteredLogs: null, loading: false, lastUpdated: null };
+const state = { tasks: [], settings: null, dashboard: null, activity: [], filteredLogs: null, loading: false, lastUpdated: null, retryingTasks: new Set(), apiOnline: false };
 
 function showPage(pageId, title) {
     for (const id of pageIds) $(`page-${id}`).classList.toggle("hidden", id !== pageId);
@@ -16,10 +16,14 @@ function showPage(pageId, title) {
 const pageTitles = { dashboard: "Дашборд", tasks: "Задачи", queue: "Очередь", activity: "Активность", workspaces: "Рабочие пространства", logs: "Журнал", models: "Модели и провайдеры", settings: "Настройки" };
 document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", () => showPage(button.dataset.page, pageTitles[button.dataset.page] || button.dataset.title || button.textContent.trim())));
 document.querySelectorAll("[data-open-page]").forEach((button) => button.addEventListener("click", () => { const id = button.dataset.openPage; showPage(id, pageTitles[id] || id); }));
-$("sidebar-toggle").addEventListener("click", () => {
-    const shell = document.querySelector(".app-shell");
-    shell.classList.toggle("sidebar-collapsed");
-    $("sidebar-toggle").setAttribute("aria-expanded", String(!shell.classList.contains("sidebar-collapsed")));
+const sidebarToggle = $("sidebar-toggle");
+const appShell = document.querySelector(".app-shell");
+sidebarToggle.addEventListener("click", () => {
+    const collapsed = appShell.classList.toggle("sidebar-collapsed");
+    sidebarToggle.textContent = collapsed ? "›" : "‹";
+    sidebarToggle.setAttribute("aria-expanded", String(!collapsed));
+    sidebarToggle.setAttribute("aria-label", collapsed ? "Раскрыть меню" : "Свернуть меню");
+    sidebarToggle.title = collapsed ? "Раскрыть меню" : "Свернуть меню";
 });
 
 function formatDate(value) {
@@ -65,7 +69,8 @@ const eventLabels = {
     task_failed: "Задача не выполнена", task_error: "Ошибка выполнения", execution_attempt: "Попытка выполнения",
     tool_started: "Вызов инструмента", tool_succeeded: "Инструмент выполнен", tool_failed: "Ошибка инструмента",
     validation_passed: "Проверка пройдена", validation_failed: "Проверка не пройдена",
-    correction_started: "Запущено исправление", correction_succeeded: "Исправление успешно", task_rollback: "Изменения отменены"
+    correction_started: "Запущено исправление", correction_succeeded: "Исправление успешно", task_rollback: "Изменения отменены",
+    runtime_ready: "Исполнитель готов", runtime_cycle_error: "Ошибка рабочего цикла"
 };
 function renderActivity(target, events, limit = 100) {
     target.replaceChildren();
@@ -203,7 +208,39 @@ function applyQueueFilters() {
     for (const task of filtered) {
         const row = document.createElement("tr"); row.className = "task-row"; addCell(row, task.title, "task-title-cell");
         const statusCell = document.createElement("td"), pill = document.createElement("span"); pill.className = `status-pill status-${String(task.status).toLowerCase()}`; pill.textContent = task.status === "Queue" ? "Ожидает" : task.status === "InProgress" ? "Выполняется" : "Ошибка"; statusCell.append(pill); row.append(statusCell);
-        addCell(row, task.priority); addCell(row, task.workspaceId || "—"); addCell(row, formatDate(task.updatedUtc)); target.append(row);
+        addCell(row, task.priority); addCell(row, task.workspaceId || "—"); addCell(row, formatDate(task.updatedUtc));
+        const action = document.createElement("td");
+        if (task.status === "Failed") {
+            const retry = document.createElement("button");
+            retry.type = "button";
+            retry.className = "row-action retry-action";
+            retry.textContent = state.retryingTasks.has(task.id) ? "Возврат…" : "Повторить";
+            retry.disabled = state.retryingTasks.has(task.id);
+            retry.addEventListener("click", () => retryFailedTask(task));
+            action.append(retry);
+        }
+        row.append(action); target.append(row);
+    }
+}
+async function retryFailedTask(task) {
+    if (state.retryingTasks.has(task.id) || task.status !== "Failed") return;
+    state.retryingTasks.add(task.id);
+    applyQueueFilters();
+    try {
+        await fetchJson(`/api/tasks/${encodeURIComponent(task.id)}/retry`, { method: "POST" });
+        const current = state.tasks.find(item => item.id === task.id);
+        if (current) {
+            current.status = "Queue";
+            current.updatedUtc = new Date().toISOString();
+        }
+        renderDashboard();
+        showToast("Задача возвращена в очередь");
+        await loadDashboard(true);
+    } catch (error) {
+        showToast(`Не удалось повторить задачу: ${error.message}`);
+    } finally {
+        state.retryingTasks.delete(task.id);
+        applyQueueFilters();
     }
 }
 $("queue-search").addEventListener("input", applyQueueFilters);
@@ -257,17 +294,45 @@ function showToast(message) {
     toast.textContent = message; toast.classList.add("visible"); clearTimeout(showToast.timer); showToast.timer = setTimeout(() => toast.classList.remove("visible"), 2600);
 }
 async function loadDashboard(silent = false) {
-    if (state.loading) return; state.loading = true;
+    if (state.loading) return;
+    state.loading = true;
     if (!silent) $("refresh").classList.add("is-loading");
+
     try {
-        const [dashboard, tasks, settings, activity] = await Promise.all([fetchJson("/api/dashboard"), fetchJson("/api/tasks"), fetchJson("/api/settings"), fetchJson("/api/activity?limit=500")]);
-        state.dashboard = dashboard; state.tasks = tasks; state.settings = settings; state.activity = activity; state.lastUpdated = Date.now();
-        renderDashboard(); ensureEditor(); bindEditorSubmit();
+        // Health is independent: the shell can distinguish a dead backend from
+        // a failed data endpoint and still keep the last successfully rendered state.
+        const health = await fetchJson("/api/health");
+        state.apiOnline = health.status === "online";
+        const results = await Promise.allSettled([
+            fetchJson("/api/dashboard"),
+            fetchJson("/api/tasks"),
+            fetchJson("/api/settings"),
+            fetchJson("/api/activity?limit=500")
+        ]);
+        const required = results.slice(0, 3);
+        const failed = required.find(result => result.status === "rejected");
+        if (failed) throw failed.reason;
+
+        state.dashboard = results[0].value;
+        state.tasks = results[1].value;
+        state.settings = results[2].value;
+        if (results[3].status === "fulfilled") state.activity = results[3].value;
+        state.lastUpdated = Date.now();
+        renderDashboard();
+        ensureEditor();
+        bindEditorSubmit();
+        $("online").innerHTML = '<span class="indicator-dot"></span>Backend online';
+        $("agent-state").textContent = "Backend подключён";
     } catch (error) {
-        $("online").innerHTML = '<span class="indicator-dot"></span>Offline'; $("agent-state").textContent = "API недоступен";
+        state.apiOnline = false;
+        $("online").innerHTML = '<span class="indicator-dot"></span>Offline';
+        $("agent-state").textContent = "API недоступен";
         if (!silent) showToast(`Не удалось обновить данные: ${error.message}`);
-        console.error("Не удалось обновить дашборд:", error);
-    } finally { state.loading = false; $("refresh").classList.remove("is-loading"); }
+        console.error("Не удалось обновить данные backend:", error);
+    } finally {
+        state.loading = false;
+        $("refresh").classList.remove("is-loading");
+    }
 }
 $("refresh").addEventListener("click", () => loadDashboard());
 loadDashboard();

@@ -20,6 +20,7 @@ internal sealed class MainForm : Form
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
     private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(2) };
     private Process? _agentProcess;
+    private string? _backendLogPath;
 
     public MainForm()
     {
@@ -69,17 +70,43 @@ internal sealed class MainForm : Form
         if (!File.Exists(backendPath))
             throw new FileNotFoundException("Не найдена сборка Agent\\backend.dll. Пересоберите Desktop-проект.", backendPath);
 
+        string logDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "TS", "TaskSandbox", "Logs");
+        Directory.CreateDirectory(logDirectory);
+        _backendLogPath = Path.Combine(logDirectory, "backend.log");
+        File.AppendAllText(_backendLogPath,
+            $"\\n===== Backend start {DateTimeOffset.Now:O} ====={Environment.NewLine}");
+
         var startInfo = new ProcessStartInfo
         {
             FileName = "dotnet",
             WorkingDirectory = Path.GetDirectoryName(backendPath)!,
             UseShellExecute = false,
-            CreateNoWindow = true
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
         };
         startInfo.ArgumentList.Add(backendPath);
 
         _agentProcess = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Не удалось запустить backend агента.");
+
+        _agentProcess.OutputDataReceived += (_, eventArgs) => AppendBackendLog(eventArgs.Data);
+        _agentProcess.ErrorDataReceived += (_, eventArgs) => AppendBackendLog(eventArgs.Data);
+        _agentProcess.BeginOutputReadLine();
+        _agentProcess.BeginErrorReadLine();
+    }
+
+    private void AppendBackendLog(string? line)
+    {
+        if (string.IsNullOrEmpty(line) || _backendLogPath is null) return;
+        try
+        {
+            File.AppendAllText(_backendLogPath, $"[{DateTimeOffset.Now:HH:mm:ss}] {line}{Environment.NewLine}");
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     private async Task WaitForBackendAsync()
@@ -88,7 +115,8 @@ internal sealed class MainForm : Form
         while (DateTime.UtcNow < deadline)
         {
             if (_agentProcess is { HasExited: true })
-                throw new InvalidOperationException($"Backend завершился с кодом {_agentProcess.ExitCode}.");
+                throw new InvalidOperationException(
+                    $"Backend завершился с кодом {_agentProcess.ExitCode}. Лог: {_backendLogPath}");
 
             try
             {
