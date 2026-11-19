@@ -9,6 +9,7 @@ function showPage(pageId, title) {
         button.classList.toggle("active", active);
         button.setAttribute("aria-current", active ? "page" : "false");
     });
+    
     $("page-title").textContent = title;
     document.querySelector(".main-content").scrollTo({ top: 0, behavior: "smooth" });
 }
