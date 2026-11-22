@@ -73,6 +73,7 @@ const eventLabels = {
     correction_started: "Запущено исправление", correction_succeeded: "Исправление успешно", task_rollback: "Изменения отменены",
     runtime_ready: "Исполнитель готов", runtime_cycle_error: "Ошибка рабочего цикла"
 };
+
 function renderActivity(target, events, limit = 100) {
     target.replaceChildren();
     const items = events.slice(0, limit);
