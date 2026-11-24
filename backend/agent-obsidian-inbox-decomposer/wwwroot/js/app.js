@@ -32,6 +32,7 @@ function formatDate(value) {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
 }
+
 function addCell(row, value, className = "") {
     const cell = document.createElement("td");
     cell.textContent = value ?? "—";
