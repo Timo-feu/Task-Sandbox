@@ -39,6 +39,7 @@ function addCell(row, value, className = "") {
     if (className) cell.className = className;
     row.append(cell);
 }
+
 function renderTasks(tasks, target, editable = false) {
     target.replaceChildren();
     if (!tasks.length) {
