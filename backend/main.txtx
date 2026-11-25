@@ -1,0 +1,285 @@
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+
+namespace TaskSandbox;
+
+public readonly record struct ChatMessage(
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("content")] string Content);
+
+public readonly record struct ChatRequest(
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("messages")] ChatMessage[] Messages,
+    [property: JsonPropertyName("temperature")] float Temperature);
+
+public readonly record struct ChatChoice(
+    [property: JsonPropertyName("message")] ChatMessage Message);
+
+public readonly record struct ChatResponse(
+    [property: JsonPropertyName("choices")] ChatChoice[]? Choices);
+
+public enum TaskStatus : byte
+{
+    Proceed,
+    InProgress,
+    Ready,
+    Rejected,
+    Failed
+}
+
+public enum TaskValidationResult : byte
+{
+    Success,
+    EmptyPath,
+    InvalidPath
+}
+
+public sealed class UserTask
+{
+    public int Id { get; init; }
+    public string Payload { get; init; } = string.Empty;
+    public string WorkDir { get; init; } = string.Empty;
+    public TaskStatus Status { get; private set; } = TaskStatus.Proceed;
+
+    public async Task RunAsync(CancellationToken cancellationToken)
+    {
+        TaskValidationResult validation = ValidateWorkDirectory(WorkDir);
+        if (validation != TaskValidationResult.Success)
+        {
+            Status = TaskStatus.Rejected;
+            Console.WriteLine($"[Task {Id}] Задача отклонена: {GetValidationMessage(validation)}");
+            return;
+        }
+
+        Status = TaskStatus.InProgress;
+        string filePath = Path.Combine(WorkDir, $"task_{Id}.txt");
+
+        try
+        {
+            Directory.CreateDirectory(WorkDir);
+            await File.WriteAllTextAsync(
+                filePath,
+                $"--- ЗАДАЧА ---{Environment.NewLine}{Payload}{Environment.NewLine}{Environment.NewLine}",
+                cancellationToken);
+
+            Console.WriteLine($"[Task {Id}] Отправка запроса в AI Backend...");
+
+            string? answer = await RequestModelAsync(Payload, cancellationToken);
+            if (answer is null)
+            {
+                Status = TaskStatus.Failed;
+                Console.WriteLine($"[Task {Id}] AI Backend вернул пустой или некорректный ответ.");
+                return;
+            }
+
+            await File.AppendAllTextAsync(
+                filePath,
+                $"--- ОТВЕТ МОДЕЛИ ---{Environment.NewLine}{answer}{Environment.NewLine}",
+                cancellationToken);
+
+            Status = TaskStatus.Ready;
+            Console.WriteLine($"[Task {Id}] Выполнена.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Status = TaskStatus.Failed;
+            Console.WriteLine($"[Task {Id}] Отменена.");
+            throw;
+        }
+        catch (HttpRequestException ex)
+        {
+            Status = TaskStatus.Failed;
+            Console.WriteLine($"[Task {Id}] Ошибка HTTP: {ex.Message}");
+        }
+        catch (IOException ex)
+        {
+            Status = TaskStatus.Failed;
+            Console.WriteLine($"[Task {Id}] Ошибка файловой системы: {ex.Message}");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Status = TaskStatus.Failed;
+            Console.WriteLine($"[Task {Id}] Недостаточно прав: {ex.Message}");
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            Status = TaskStatus.Failed;
+            Console.WriteLine($"[Task {Id}] Некорректный JSON от AI Backend: {ex.Message}");
+        }
+        catch (OperationCanceledException)
+        {
+            Status = TaskStatus.Failed;
+            Console.WriteLine($"[Task {Id}] Превышено время ожидания AI Backend.");
+        }
+    }
+
+    private static TaskValidationResult ValidateWorkDirectory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return TaskValidationResult.EmptyPath;
+
+        try
+        {
+            _ = Path.GetFullPath(path);
+            return TaskValidationResult.Success;
+        }
+        catch (ArgumentException)
+        {
+            return TaskValidationResult.InvalidPath;
+        }
+        catch (NotSupportedException)
+        {
+            return TaskValidationResult.InvalidPath;
+        }
+        catch (PathTooLongException)
+        {
+            return TaskValidationResult.InvalidPath;
+        }
+    }
+
+    private static string GetValidationMessage(TaskValidationResult result) => result switch
+    {
+        TaskValidationResult.EmptyPath => "Путь к рабочей директории пустой.",
+        TaskValidationResult.InvalidPath => "Некорректный путь к рабочей директории.",
+        _ => string.Empty
+    };
+
+    private static async Task<string?> RequestModelAsync(
+        string prompt,
+        CancellationToken cancellationToken)
+    {
+        var request = new ChatRequest(
+            Model: "local-model",
+            Messages:
+            [
+                new ChatMessage("system", "Ты полезный ИИ-ассистент. Отвечай четко, кратко и на русском языке."),
+                new ChatMessage("user", prompt)
+            ],
+            Temperature: 0.7f);
+
+        using HttpResponseMessage response = await Program.LlmClient.PostAsJsonAsync(
+            "/v1/chat/completions",
+            request,
+            cancellationToken);
+
+        response.EnsureSuccessStatusCode();
+
+        ChatResponse? result = await response.Content.ReadFromJsonAsync<ChatResponse>(
+            cancellationToken: cancellationToken);
+
+        if (result?.Choices is not { Length: > 0 } choices ||
+            string.IsNullOrWhiteSpace(choices[0].Message.Content))
+        {
+            return null;
+        }
+
+        return choices[0].Message.Content;
+    }
+}
+
+public static class Program
+{
+    private const int QueueCapacity = 64;
+
+    public static readonly Channel<UserTask> UserTaskChannel =
+        Channel.CreateBounded<UserTask>(new BoundedChannelOptions(QueueCapacity)
+        {
+            SingleReader = true,
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.Wait
+        });
+
+    public static readonly HttpClient LlmClient = new(new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(15),
+        UseProxy = false
+    })
+    {
+        BaseAddress = new Uri("http://localhost:1234"),
+        Timeout = TimeSpan.FromMinutes(5)
+    };
+
+    public static async Task Main()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellationSource.Cancel();
+        };
+
+        string inputFilePath = Path.Combine(Environment.CurrentDirectory, "prompts.txt");
+        string targetDirectory = Path.Combine(Environment.CurrentDirectory, "TasksDir");
+        CancellationToken cancellationToken = cancellationSource.Token;
+
+        Task consumerTask = ConsumeAsync(cancellationToken);
+
+        try
+        {
+            await EnsureTestFileExistsAsync(inputFilePath, cancellationToken);
+            await ProduceAsync(inputFilePath, targetDirectory, cancellationToken);
+        }
+        finally
+        {
+            UserTaskChannel.Writer.TryComplete();
+            await consumerTask;
+        }
+
+        Console.WriteLine("[System] Обработка очереди завершена.");
+    }
+
+    private static async Task ProduceAsync(
+        string inputFilePath,
+        string targetDirectory,
+        CancellationToken cancellationToken)
+    {
+        int taskId = 0;
+
+        await foreach (string line in File.ReadLinesAsync(inputFilePath, cancellationToken))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            var task = new UserTask
+            {
+                Id = taskId++,
+                Payload = line,
+                WorkDir = targetDirectory
+            };
+
+            await UserTaskChannel.Writer.WriteAsync(task, cancellationToken);
+            Console.WriteLine($"[Producer] Задача {task.Id} добавлена в очередь.");
+        }
+    }
+
+    private static async Task ConsumeAsync(CancellationToken cancellationToken)
+    {
+        await foreach (UserTask task in UserTaskChannel.Reader.ReadAllAsync(cancellationToken))
+            await task.RunAsync(cancellationToken);
+    }
+
+    private static async Task EnsureTestFileExistsAsync(
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        if (File.Exists(filePath))
+            return;
+
+        string[] testPrompts =
+        [
+            "Напиши короткое хокку про программиста на C#.",
+            "Объясни, что такое асинхронность простыми словами (в двух предложениях).",
+            "Назови 3 главные причины использовать структуры (struct) вместо классов (class).",
+            "Придумай смешное название для кофейни, которую открыли айтишники."
+        ];
+
+        await File.WriteAllLinesAsync(filePath, testPrompts, cancellationToken);
+        Console.WriteLine($"[System] Создан тестовый файл: {filePath}");
+    }
+}

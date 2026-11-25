@@ -1,0 +1,218 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+
+namespace TaskSandbox.Execution;
+
+public sealed record ProcessExecutionResult(
+    bool Success,
+    int? ExitCode,
+    bool TimedOut,
+    bool OutputTruncated,
+    string Output,
+    TimeSpan Duration,
+    string Profile);
+
+/// <summary>Runs only profile-defined build/test executables inside the configured Workspace.</summary>
+public sealed class ExecutionService
+{
+    private readonly string _workspaceRoot;
+    private readonly string _workspacePrefix;
+    private readonly TimeSpan _timeout;
+    private readonly int _maxOutputCharacters;
+
+    public ExecutionService(string workspacePath, TimeSpan timeout, int maxOutputCharacters)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(workspacePath);
+        if (timeout < TimeSpan.FromSeconds(10) || timeout > TimeSpan.FromMinutes(30))
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        if (maxOutputCharacters is < 4096 or > 262144)
+            throw new ArgumentOutOfRangeException(nameof(maxOutputCharacters));
+
+        _workspaceRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(workspacePath));
+        if (!Directory.Exists(_workspaceRoot))
+            throw new DirectoryNotFoundException($"Workspace не найден: {_workspaceRoot}");
+        _workspacePrefix = _workspaceRoot + Path.DirectorySeparatorChar;
+        _timeout = timeout;
+        _maxOutputCharacters = maxOutputCharacters;
+        EnsureNoReparsePoints(_workspaceRoot);
+    }
+
+    public async Task<ProcessExecutionResult> ExecuteAsync(
+        string operation,
+        JsonElement arguments,
+        CancellationToken cancellationToken = default)
+    {
+        bool build = operation is "project_build" or "dotnet_build";
+        bool test = operation is "project_test" or "dotnet_test";
+        if (!build && !test)
+            return Failure($"Операция '{operation}' не разрешена.", "unknown");
+
+        string? target = GetOptionalString(arguments, "project");
+        string projectDirectory = string.IsNullOrWhiteSpace(target) ? _workspaceRoot : ResolveProjectDirectory(target);
+        BuildTestProfile? profile = BuildTestProfile.Detect(projectDirectory);
+        if (profile is null)
+            return Failure("Не удалось определить поддерживаемый профиль проекта. Ожидается manifest в корне проекта.", "unknown");
+
+        ProcessCommand? command = build ? profile.Build : profile.Test;
+        if (command is null)
+            return Failure(build
+                ? $"Для профиля {profile.Name} отдельная команда сборки не предусмотрена."
+                : $"В профиле {profile.Name} не обнаружена конфигурация тестов.", profile.Name);
+
+        string configuration = GetOptionalString(arguments, "configuration") ?? "Debug";
+        if (configuration is not ("Debug" or "Release"))
+            return Failure("configuration должен быть Debug или Release.", profile.Name);
+
+        bool windowsBatchTool = OperatingSystem.IsWindows() &&
+            (command.Executable is "npm" or "pnpm" or "yarn" or "mvn" or "gradle");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = windowsBatchTool ? "cmd.exe" : command.Executable,
+            WorkingDirectory = projectDirectory,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        if (windowsBatchTool)
+        {
+            startInfo.ArgumentList.Add("/d");
+            startInfo.ArgumentList.Add("/s");
+            startInfo.ArgumentList.Add("/c");
+            startInfo.ArgumentList.Add(command.Executable + " " + string.Join(" ", command.Arguments));
+        }
+        else
+        {
+            foreach (string argument in command.Arguments)
+                startInfo.ArgumentList.Add(argument);
+        }
+        if (profile.Name == ".NET")
+            startInfo.ArgumentList.Add("--configuration");
+        if (profile.Name == ".NET")
+            startInfo.ArgumentList.Add(configuration);
+
+        using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        var output = new BoundedProcessOutput(_maxOutputCharacters);
+        var stopwatch = Stopwatch.StartNew();
+        if (!process.Start())
+            return Failure($"Не удалось запустить {command.Executable}.", profile.Name);
+
+        Task stdoutTask = DrainAsync(process.StandardOutput, output, "stdout");
+        Task stderrTask = DrainAsync(process.StandardError, output, "stderr");
+        using var timeoutSource = new CancellationTokenSource(_timeout);
+        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+        bool timedOut = false;
+        try
+        {
+            await process.WaitForExitAsync(linkedSource.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            timedOut = timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested;
+            bool callerCancelled = cancellationToken.IsCancellationRequested;
+            TryKill(process);
+            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+            if (callerCancelled)
+                throw new OperationCanceledException(cancellationToken);
+        }
+
+        await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+        stopwatch.Stop();
+        int? exitCode = process.HasExited ? process.ExitCode : null;
+        string text = output.GetText();
+        if (timedOut)
+            text += $"\n[ExecutionService] Превышено ограничение времени {_timeout.TotalSeconds:0} сек.; процесс остановлен.";
+        if (output.Truncated)
+            text += "\n[ExecutionService] Вывод обрезан по установленному лимиту.";
+        return new ProcessExecutionResult(!timedOut && exitCode == 0, exitCode, timedOut,
+            output.Truncated, text, stopwatch.Elapsed, profile.Name);
+    }
+
+    private string ResolveProjectDirectory(string relativePath)
+    {
+        if (Path.IsPathRooted(relativePath) || relativePath.Contains(':') ||
+            relativePath.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries)
+                .Any(static part => part is "." or ".."))
+            throw new InvalidDataException("project должен быть относительным путём внутри Workspace без '.' и '..'.");
+
+        string fullPath = Path.GetFullPath(Path.Combine(_workspaceRoot, relativePath));
+        if (!fullPath.StartsWith(_workspacePrefix,
+                OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) &&
+            !string.Equals(fullPath, _workspaceRoot,
+                OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            throw new InvalidDataException("Путь проекта выходит за пределы Workspace.");
+        if (!Directory.Exists(fullPath))
+            throw new DirectoryNotFoundException($"Каталог проекта не найден: {relativePath}. Укажи каталог, а не файл.");
+        EnsureNoReparsePoints(fullPath);
+        return fullPath;
+    }
+
+    private static string? GetOptionalString(JsonElement arguments, string name)
+    {
+        if (arguments.ValueKind != JsonValueKind.Object || !arguments.TryGetProperty(name, out JsonElement value))
+            return null;
+        if (value.ValueKind != JsonValueKind.String)
+            throw new InvalidDataException($"Аргумент '{name}' должен быть строкой.");
+        return value.GetString();
+    }
+
+    private static ProcessExecutionResult Failure(string message, string profile) =>
+        new(false, null, false, false, message, TimeSpan.Zero, profile);
+
+    private async Task DrainAsync(StreamReader reader, BoundedProcessOutput output, string streamName)
+    {
+        while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+            output.Append(streamName, line);
+    }
+
+    private static void EnsureNoReparsePoints(string path)
+    {
+        string fullPath = Path.GetFullPath(path);
+        string? current = Directory.Exists(fullPath) ? fullPath : Path.GetDirectoryName(fullPath);
+        while (!string.IsNullOrEmpty(current))
+        {
+            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException($"Символьные ссылки и reparse points запрещены: {current}");
+            current = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(current));
+        }
+    }
+
+    private static void TryKill(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException) { }
+        catch (System.ComponentModel.Win32Exception) { }
+    }
+
+    private sealed class BoundedProcessOutput(int limit)
+    {
+        private readonly StringBuilder _builder = new(Math.Min(limit, 8192));
+        public bool Truncated { get; private set; }
+
+        public void Append(string stream, string line)
+        {
+            if (_builder.Length >= limit)
+            {
+                Truncated = true;
+                return;
+            }
+            string entry = $"[{stream}] {line}{Environment.NewLine}";
+            int remaining = limit - _builder.Length;
+            if (entry.Length > remaining)
+            {
+                _builder.Append(entry.AsSpan(0, remaining));
+                Truncated = true;
+                return;
+            }
+            _builder.Append(entry);
+        }
+
+        public string GetText() => _builder.ToString();
+    }
+}
