@@ -22,6 +22,7 @@ public static class WebDashboardHost
     {
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.WebHost.UseUrls("http://127.0.0.1:5080");
+        
         await using WebApplication app = builder.Build();
         string webRoot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
         if (Directory.Exists(webRoot))
