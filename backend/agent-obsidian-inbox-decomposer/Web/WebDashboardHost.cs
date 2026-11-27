@@ -38,6 +38,7 @@ public static class WebDashboardHost
         }
 
         string agentRoot = Path.Combine(Path.GetFullPath(settings.Obsidian.VaultPath), "LocalCodingAgent");
+        
         app.MapGet("/api/health", () => Results.Ok(new
         {
             status = "online",
